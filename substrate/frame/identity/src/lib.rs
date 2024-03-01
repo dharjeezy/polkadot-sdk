@@ -1343,25 +1343,35 @@ impl<T: Config> Pallet<T> {
 	///
 	/// NOTE: This function is here temporarily for migration of Identity info from the Polkadot
 	/// Relay Chain into a system parachain. It will be removed after the migration.
-	pub fn reap_identity(who: &T::AccountId) -> Result<(u32, u32, u32), DispatchError> {
-		// `take` any storage items keyed by `target`
-		// identity
-		let (id, _maybe_username) = <IdentityOf<T>>::take(&who).ok_or(Error::<T>::NoIdentity)?;
-		let registrars = id.judgements.len() as u32;
-		let encoded_byte_size = id.info.encoded_size() as u32;
+	pub fn reap_identity(
+		who_vec: Vec<T::AccountId>,
+	) -> Result<Vec<(T::AccountId, u32, u32, u32)>, DispatchError> {
+		let mut tuple: Vec<(T::AccountId, u32, u32, u32)> = vec![];
 
-		// subs
-		let (subs_deposit, sub_ids) = <SubsOf<T>>::take(&who);
-		let actual_subs = sub_ids.len() as u32;
-		for sub in sub_ids.iter() {
-			<SuperOf<T>>::remove(sub);
+		for who in who_vec {
+			// `take` any storage items keyed by `target`
+			// identity
+			let (id, _maybe_username) =
+				<IdentityOf<T>>::take(&who).ok_or(Error::<T>::NoIdentity)?;
+			let registrars = id.judgements.len() as u32;
+			let encoded_byte_size = id.info.encoded_size() as u32;
+
+			// subs
+			let (subs_deposit, sub_ids) = <SubsOf<T>>::take(&who);
+			let actual_subs = sub_ids.len() as u32;
+			for sub in sub_ids.iter() {
+				<SuperOf<T>>::remove(sub);
+			}
+
+			// unreserve any deposits
+			let deposit = id.total_deposit().saturating_add(subs_deposit);
+			let err_amount = T::Currency::unreserve(&who, deposit);
+			debug_assert!(err_amount.is_zero());
+
+			tuple.push((who, registrars, encoded_byte_size, actual_subs));
 		}
 
-		// unreserve any deposits
-		let deposit = id.total_deposit().saturating_add(subs_deposit);
-		let err_amount = T::Currency::unreserve(&who, deposit);
-		debug_assert!(err_amount.is_zero());
-		Ok((registrars, encoded_byte_size, actual_subs))
+		Ok(tuple)
 	}
 
 	/// Update the deposits held by `target` for its identity info.
