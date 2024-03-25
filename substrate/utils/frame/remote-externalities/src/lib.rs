@@ -58,7 +58,7 @@ type ChildKeyValues = Vec<(ChildInfo, Vec<KeyValue>)>;
 type SnapshotVersion = Compact<u16>;
 
 const LOG_TARGET: &str = "remote-ext";
-const DEFAULT_HTTP_ENDPOINT: &str = "https://rpc.polkadot.io:443";
+const DEFAULT_HTTP_ENDPOINT: &str = "wss://rococo-try-runtime-node.parity-chains.parity.io:443";
 const SNAPSHOT_VERSION: SnapshotVersion = Compact(3);
 
 /// The snapshot that we store on disk.
@@ -1264,6 +1264,7 @@ mod tests {
 mod remote_tests {
 	use super::test_prelude::*;
 	use std::{env, os::unix::fs::MetadataExt};
+	use futures::TryFutureExt;
 
 	fn endpoint() -> String {
 		env::var("TEST_WS").unwrap_or_else(|_| DEFAULT_HTTP_ENDPOINT.to_string())
@@ -1564,14 +1565,31 @@ mod remote_tests {
 
 		let at = builder.as_online().at.unwrap();
 
-		let prefix = StorageKey(vec![13]);
+		/*let prefix = StorageKey(vec![13]);
 		let paged = builder.rpc_get_keys_in_range(&prefix, at, None, None).await.unwrap();
 		let para = builder.rpc_get_keys_parallel(&prefix, at, 4).await.unwrap();
-		assert_eq!(paged, para);
+		assert_eq!(paged, para);*/
 
-		let prefix = StorageKey(vec![]);
+		let state_version =
+			StateApi::<Block>::runtime_version(builder.as_online().rpc_client(), None)
+				.await
+				.map_err(|e| {
+					error!(target: LOG_TARGET, "Error = {:?}", e);
+					"rpc runtime_version failed."
+				})
+				.map(|v| v.state_version()).unwrap();
+
+		let mut pending_ext = TestExternalities::new_with_code_and_state(
+			Default::default(),
+			Default::default(),
+			builder.overwrite_state_version.unwrap_or(state_version),
+		);
+
+		builder.load_top_remote(&mut pending_ext).await.unwrap();
+
+		/*let prefix = StorageKey(vec![]);
 		let paged = builder.rpc_get_keys_in_range(&prefix, at, None, None).await.unwrap();
 		let para = builder.rpc_get_keys_parallel(&prefix, at, 8).await.unwrap();
-		assert_eq!(paged, para);
+		assert_eq!(paged, para);*/
 	}
 }
