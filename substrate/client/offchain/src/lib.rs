@@ -36,26 +36,32 @@
 #![warn(missing_docs)]
 
 use std::{fmt, sync::Arc};
+use std::collections::VecDeque;
+use std::marker::PhantomData;
 
 use futures::{
 	future::{ready, Future},
 	prelude::*,
 };
+use log::{debug, error, info, warn};
 use parking_lot::Mutex;
-use sc_client_api::BlockchainEvents;
+use sc_client_api::{Backend, BlockchainEvents, FinalityNotification, FinalityNotifications, HeaderBackend};
 use sc_network::{NetworkPeers, NetworkStateInfo};
 use sc_transaction_pool_api::OffchainTransactionPoolFactory;
 use sp_api::{ApiExt, ProvideRuntimeApi};
 use sp_core::{offchain, traits::SpawnNamed};
 use sp_externalities::Extension;
 use sp_keystore::{KeystoreExt, KeystorePtr};
-use sp_runtime::traits::{self, Header};
+use sp_runtime::traits::{self, Block, Header, NumberFor, One};
 use threadpool::ThreadPool;
+use sc_client_api::blockchain::{CachedHeaderMetadata, HeaderMetadata};
 
 mod api;
 
 pub use sp_core::offchain::storage::OffchainDb;
+use sp_core::offchain::StorageKind;
 pub use sp_offchain::{OffchainWorkerApi, STORAGE_PREFIX};
+use sp_runtime::Saturating;
 
 const LOG_TARGET: &str = "offchain-worker";
 
@@ -321,6 +327,173 @@ where
 	fn spawn_worker(&self, f: impl FnOnce() -> () + Send + 'static) {
 		self.thread_pool.lock().execute(f);
 	}
+}
+
+pub type NodeIndex = u64;
+
+/// `OffchainMMR` exposes MMR offchain canonicalization and pruning logic.
+pub struct OffchainStorageCanonical<B: Block, BE: Backend<B>, C> {
+	backend: Arc<BE>,
+	client: Arc<C>,
+	offchain_db: OffchainDb<BE::OffchainStorage>,
+	indexing_prefix: Vec<u8>,
+	first_mmr_block: NumberFor<B>,
+	best_canonicalized: NumberFor<B>,
+}
+
+pub trait OffchainClient<B, BE>:
+BlockchainEvents<B> + HeaderBackend<B> + HeaderMetadata<B> + ProvideRuntimeApi<B>
+	where
+		B: Block,
+		BE: Backend<B>,
+		Self::Api: OffchainApi<B, NumberFor<B>>,
+{
+
+}
+
+sp_api::decl_runtime_apis! {
+	/// API to interact with MMR pallet.
+	#[api_version(2)]
+	pub trait OffchainApi<Hash: codec::Codec, BlockNumber: codec::Codec> {
+
+	}
+}
+
+impl<B, BE, C> OffchainStorageCanonical<B, BE, C>
+	where
+		BE: Backend<B>,
+		B: Block,
+		C:  BE
+{
+	pub fn new(
+		backend: Arc<BE>,
+		client: Arc<C>,
+		offchain_db: OffchainDb<BE::OffchainStorage>,
+		indexing_prefix: Vec<u8>,
+		first_mmr_block: NumberFor<B>,
+	) -> Option<Self> {
+		/*let mut best_canonicalized = first_mmr_block.saturating_sub(One::one());
+		best_canonicalized = aux_schema::load_or_init_state::<B, BE>(&*backend, best_canonicalized)
+			.map_err(|e| error!(target: LOG_TARGET, "Error loading state from aux db: {:?}", e))
+			.ok()?;
+
+		Some(Self {
+			backend,
+			client,
+			offchain_db,
+			indexing_prefix,
+			first_mmr_block,
+			best_canonicalized,
+		})*/
+		todo!()
+	}
+
+	fn node_temp_offchain_key(&self, pos: NodeIndex, parent_hash: B::Hash) -> Vec<u8> {
+		todo!()
+	}
+
+	fn node_canon_offchain_key(&self, pos: NodeIndex) -> Vec<u8> {
+		todo!()
+	}
+
+	fn write_gadget_state_or_log(&self) {
+		todo!()
+	}
+
+	fn header_metadata_or_log(
+		&self,
+		hash: B::Hash,
+		action: &str,
+	) -> Option<CachedHeaderMetadata<B>> {
+		todo!()
+	}
+
+	fn right_branch_ending_in_block_or_log(
+		&self,
+		block_num: NumberFor<B>,
+		action: &str,
+	) -> Option<Vec<NodeIndex>> {
+		todo!()
+	}
+
+	fn prune_branch(&mut self, block_hash: &B::Hash) {
+		todo!()
+	}
+
+	fn canonicalize_branch(&mut self, block_hash: B::Hash) {
+		todo!()
+	}
+
+	/// In case of missed finality notifications (node restarts for example),
+	/// make sure to also canon everything leading up to `notification.tree_route`.
+	pub fn canonicalize_catch_up(&mut self, notification: &FinalityNotification<B>) {
+		todo!()
+	}
+
+	fn handle_potential_pallet_reset(&mut self, notification: &FinalityNotification<B>) {
+		todo!()
+	}
+
+	/// Move leafs and nodes added by finalized blocks in offchain db from _fork-aware key_ to
+	/// _canonical key_.
+	/// Prune leafs and nodes added by stale blocks in offchain db from _fork-aware key_.
+	pub fn canonicalize_and_prune(&mut self, notification: FinalityNotification<B>) {
+		todo!()
+	}
+}
+
+struct OffchainBuilder<B: Block, BE: Backend<B>, C> {
+	backend: Arc<BE>,
+	client: Arc<C>,
+	offchain_db: OffchainDb<BE::OffchainStorage>,
+	indexing_prefix: Vec<u8>,
+
+	_phantom: PhantomData<B>,
+}
+
+impl<B, BE, C> OffchainBuilder<B, BE, C>
+	where
+		B: Block,
+		BE: Backend<B>,
+		C: BE,
+{
+	async fn try_build(
+		self,
+		finality_notifications: &mut FinalityNotifications<B>,
+	) -> Option<OffchainStorageCanonical<B, BE, C>> {
+		/*while let Some(notification) = finality_notifications.next().await {
+			if let Some(first_mmr_block_num) = self.client.first_mmr_block_num(&notification) {
+				let mut offchain_mmr = OffchainStorageCanonical::new(
+					self.backend,
+					self.client,
+					self.offchain_db,
+					self.indexing_prefix,
+					first_mmr_block_num,
+				)?;
+				// We need to make sure all blocks leading up to current notification
+				// have also been canonicalized.
+				offchain_mmr.canonicalize_catch_up(&notification);
+				// We have to canonicalize and prune the blocks in the finality
+				// notification that lead to building the offchain-mmr as well.
+				offchain_mmr.canonicalize_and_prune(notification);
+				return Some(offchain_mmr)
+			}
+		}
+
+		error!(
+			target: LOG_TARGET,
+			"Finality notifications stream closed unexpectedly. \
+			Couldn't build the canonicalization engine",
+		);
+		None*/
+		todo!()
+	}
+}
+
+pub struct OffchainGadget<B: Block, BE: Backend<B>, C> {
+	finality_notifications: FinalityNotifications<B>,
+
+	_phantom: PhantomData<(B, BE, C)>,
 }
 
 #[cfg(test)]
