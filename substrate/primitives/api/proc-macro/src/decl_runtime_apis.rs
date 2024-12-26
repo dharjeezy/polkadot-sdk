@@ -27,6 +27,7 @@ use crate::{
 		versioned_trait_name, AllowSelfRefInParameters,
 	},
 };
+use polkadot_primitives::EncodeAs;
 
 use proc_macro2::{Span, TokenStream};
 
@@ -199,6 +200,14 @@ fn generate_runtime_decls(decls: &[ItemTrait]) -> Result<TokenStream> {
 		// because the method attributes are stripped at this point
 		decl.items.iter_mut().for_each(|i| match i {
 			TraitItem::Fn(ref mut method) => {
+
+				for param in method.sig.inputs.iter_mut() {
+					if let FnArg::Typed(pat_type) = param {
+						let param_type = &pat_type.ty;
+						pat_type.ty = parse_quote!(impl EncodeAs<#param_type>);
+					}
+				}
+
 				let method_attrs = remove_supported_attributes(&mut method.attrs);
 				let mut method_version = trait_api_version;
 				// validate the api version for the method (if any) and generate default

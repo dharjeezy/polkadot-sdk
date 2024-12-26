@@ -823,7 +823,8 @@ decl_runtime_apis! {
 		#[renamed("initialise_block", 2)]
 		fn initialize_block(header: &<Block as BlockT>::Header);
 		/// Initialize a block with the given header and return the runtime executive mode.
-		fn initialize_block(header: &<Block as BlockT>::Header) -> ExtrinsicInclusionMode;
+		fn initialize_block<'a>(header:  &'a<Block as BlockT>::Header)  -> ExtrinsicInclusionMode
+		where Block: EncodeAs;
 	}
 
 	/// The `Metadata` api trait that returns metadata for the runtime.
