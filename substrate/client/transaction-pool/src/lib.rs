@@ -22,7 +22,7 @@
 #![warn(missing_docs)]
 #![warn(unused_extern_crates)]
 
-mod builder;
+pub mod builder;
 mod common;
 mod fork_aware_txpool;
 mod graph;

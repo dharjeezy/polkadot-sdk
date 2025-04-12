@@ -459,12 +459,12 @@ where
 }
 
 /// Transaction pool adapter.
-pub struct TransactionPoolAdapter<C, P> {
+pub struct TransactionPoolAdapter<C, P: ?Sized> {
 	pool: Arc<P>,
 	client: Arc<C>,
 }
 
-impl<C, P> TransactionPoolAdapter<C, P> {
+impl<C, P: ?Sized> TransactionPoolAdapter<C, P> {
 	/// Constructs a new instance of [`TransactionPoolAdapter`].
 	pub fn new(pool: Arc<P>, client: Arc<C>) -> Self {
 		Self { pool, client }
@@ -501,7 +501,7 @@ where
 		+ Send
 		+ Sync
 		+ 'static,
-	Pool: 'static + TransactionPool<Block = B, Hash = H, Error = E>,
+	Pool: TransactionPool<Block = B, Hash = H, Error = E> + Send + Sync + 'static,
 	B: BlockT,
 	H: std::hash::Hash + Eq + sp_runtime::traits::Member + sp_runtime::traits::MaybeSerialize,
 	E: 'static + IntoPoolError + From<sc_transaction_pool_api::error::Error>,

@@ -81,6 +81,7 @@ use sc_rpc_spec_v2::{
 };
 use sc_telemetry::{telemetry, ConnectionMessage, Telemetry, TelemetryHandle, SUBSTRATE_INFO};
 use sc_transaction_pool_api::{MaintainedTransactionPool, TransactionPool};
+use sc_transaction_pool::builder::FullClientTransactionPool;
 use sc_utils::mpsc::{tracing_unbounded, TracingUnboundedSender};
 use sp_api::{CallApiAt, ProvideRuntimeApi};
 use sp_blockchain::{HeaderBackend, HeaderMetadata};
@@ -95,6 +96,7 @@ use std::{
 	sync::Arc,
 	time::{Duration, SystemTime},
 };
+use std::marker::PhantomData;
 
 /// Full client type.
 pub type TFullClient<TBl, TRtApi, TExec> =
@@ -811,6 +813,13 @@ pub struct BuildNetworkParams<'a, Block, Net, TxPool, IQ, Client>
 where
 	Block: BlockT,
 	Net: NetworkBackend<Block, <Block as BlockT>::Hash>,
+	Client: sp_api::ProvideRuntimeApi<Block>
+	+ sc_client_api::BlockBackend<Block>
+	+ sc_client_api::blockchain::HeaderBackend<Block>
+	+ sp_runtime::traits::BlockIdTo<Block>
+	+ sp_blockchain::HeaderMetadata<Block, Error = sp_blockchain::Error>
+	+ 'static,
+	Client::Api: sp_transaction_pool::runtime_api::TaggedTransactionQueue<Block>,
 {
 	/// The service configuration.
 	pub config: &'a Configuration,
@@ -819,7 +828,7 @@ where
 	/// A shared client returned by `new_full_parts`.
 	pub client: Arc<Client>,
 	/// A shared transaction pool.
-	pub transaction_pool: Arc<TxPool>,
+	pub transaction_pool: Arc<dyn FullClientTransactionPool<Block, Client> + Send + Sync>,
 	/// A handle for spawning tasks.
 	pub spawn_handle: SpawnTaskHandle,
 	/// An import queue.
@@ -835,6 +844,7 @@ where
 	pub block_relay: Option<BlockRelayParams<Block, Net>>,
 	/// Metrics.
 	pub metrics: NotificationMetrics,
+	pub _phantom: PhantomData<TxPool>,
 }
 
 /// Build the network service, the network status sinks and an RPC sender.
@@ -860,6 +870,7 @@ where
 		+ HeaderBackend<Block>
 		+ BlockchainEvents<Block>
 		+ 'static,
+	Client::Api: sp_transaction_pool::runtime_api::TaggedTransactionQueue<Block>,
 	TxPool: TransactionPool<Block = Block, Hash = <Block as BlockT>::Hash> + 'static,
 	IQ: ImportQueue<Block> + 'static,
 	Net: NetworkBackend<Block, <Block as BlockT>::Hash>,
@@ -875,6 +886,7 @@ where
 		warp_sync_config,
 		block_relay,
 		metrics,
+		_phantom
 	} = params;
 
 	let block_announce_validator = if let Some(f) = block_announce_validator_builder {
@@ -956,6 +968,7 @@ where
 		network_service_provider,
 		metrics_registry,
 		metrics,
+		_phantom
 	})
 }
 
@@ -964,6 +977,14 @@ pub struct BuildNetworkAdvancedParams<'a, Block, Net, TxPool, IQ, Client>
 where
 	Block: BlockT,
 	Net: NetworkBackend<Block, <Block as BlockT>::Hash>,
+	Client: sp_api::ProvideRuntimeApi<Block>
+	+ sc_client_api::BlockBackend<Block>
+	+ sc_client_api::blockchain::HeaderBackend<Block>
+	+ sp_runtime::traits::BlockIdTo<Block>
+	+ sp_blockchain::HeaderMetadata<Block, Error = sp_blockchain::Error>
+	+ 'static,
+	Client::Api: sp_transaction_pool::runtime_api::TaggedTransactionQueue<Block>,
+
 {
 	/// Role of the local node.
 	pub role: Role,
@@ -980,7 +1001,7 @@ where
 	/// A shared client returned by `new_full_parts`.
 	pub client: Arc<Client>,
 	/// A shared transaction pool.
-	pub transaction_pool: Arc<TxPool>,
+	pub transaction_pool: Arc<dyn FullClientTransactionPool<Block, Client> + Send + Sync>,
 	/// A handle for spawning tasks.
 	pub spawn_handle: SpawnTaskHandle,
 	/// An import queue.
@@ -995,6 +1016,7 @@ where
 	pub metrics_registry: Option<&'a Registry>,
 	/// Metrics.
 	pub metrics: NotificationMetrics,
+	pub _phantom: PhantomData<TxPool>,
 }
 
 /// Build the network service, the network status sinks and an RPC sender, this is a lower-level
@@ -1021,6 +1043,14 @@ where
 		+ HeaderBackend<Block>
 		+ BlockchainEvents<Block>
 		+ 'static,
+	Client: sp_api::ProvideRuntimeApi<Block>
+	+ sc_client_api::BlockBackend<Block>
+	+ sc_client_api::blockchain::HeaderBackend<Block>
+	+ sp_runtime::traits::BlockIdTo<Block>
+	+ sp_blockchain::HeaderMetadata<Block, Error = sp_blockchain::Error>
+	+ 'static,
+	Client::Api: sp_transaction_pool::runtime_api::TaggedTransactionQueue<Block>,
+
 	TxPool: TransactionPool<Block = Block, Hash = <Block as BlockT>::Hash> + 'static,
 	IQ: ImportQueue<Block> + 'static,
 	Net: NetworkBackend<Block, <Block as BlockT>::Hash>,
@@ -1041,6 +1071,7 @@ where
 		network_service_provider,
 		metrics_registry,
 		metrics,
+		_phantom
 	} = params;
 
 	let genesis_hash = client.info().genesis_hash;
@@ -1105,7 +1136,7 @@ where
 	let (tx_handler, tx_handler_controller) = transactions_handler_proto.build(
 		network.clone(),
 		sync_service.clone(),
-		Arc::new(TransactionPoolAdapter { pool: transaction_pool, client: client.clone() }),
+		Arc::new(TransactionPoolAdapter { pool: transaction_pool , client: client.clone() }),
 		metrics_registry,
 	)?;
 	spawn_handle.spawn_blocking(
