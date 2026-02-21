@@ -70,8 +70,9 @@ pub type BlockNumberFor<T, I> =
 	<<T as Config<I>>::BlockNumberProvider as BlockNumberProvider>::BlockNumber;
 
 type AccountIdLookupOf<T> = <<T as frame_system::Config>::Lookup as StaticLookup>::Source;
-pub type BalanceOf<T, I = ()> =
-	<<T as Config<I>>::Fungible as fungible::Inspect<<T as frame_system::Config>::AccountId>>::Balance;
+pub type BalanceOf<T, I = ()> = <<T as Config<I>>::Fungible as fungible::Inspect<
+	<T as frame_system::Config>::AccountId,
+>>::Balance;
 pub type VotingOf<T, I = ()> = Voting<
 	BalanceOf<T, I>,
 	<T as frame_system::Config>::AccountId,
