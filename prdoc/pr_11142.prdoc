@@ -1,0 +1,25 @@
+title: Migrate pallet-conviction-voting to using fungible traits
+doc:
+- audience: Todo
+  description: |-
+    Migrate pallet-conviction-voting from Currency/LockableCurrency traits to fungible traits (freezes), as part of #226.
+
+    Locks are replaced with freezes (fungible::MutateFreeze), which are identical in operation in that they both prevent balance from dropping below a threshold without partitioning into separate pools.
+
+      Changes
+
+      - Replace type Currency with type Fungible + type RuntimeFreezeReason in the pallet's Config trait
+      - Add FreezeReason::ConvictionVoting composite enum
+      - Convert all lock operations (set_lock, extend_lock, remove_lock) to freeze equivalents (set_freeze, extend_freeze, thaw)
+      - Add SteppedMigration (LazyMigrationV0ToV1) to convert existing locks to freezes at runtime upgrade
+      - Add v1_migration_step benchmark for the migration
+      - Bump storage version to 1
+crates:
+- name: asset-hub-westend-runtime
+  bump: major
+- name: rococo-runtime
+  bump: major
+- name: westend-runtime
+  bump: major
+- name: pallet-conviction-voting
+  bump: major
