@@ -489,14 +489,15 @@ impl ConfigDef {
 								consts_metadata.push(const_def);
 							},
 							Err(e) => {
-								if constant_attr.value_path.is_some() {
-									let msg = format!(
-										"Invalid `#[pallet::constant(::PATH)]`: This syntax still requires a \
-                        `Get<T>` bound to determine the constant's type for metadata. \
-                        e.g., `type MyConst: Get<&'static str> + MyTrait;`. \
-                        Compiler error: {}", e
-									);
-									return Err(syn::Error::new(typ.span(), msg));
+								if let Some(value_path) = constant_attr.value_path {
+									let type_: syn::Type = syn::parse_quote!(&'static str);
+									consts_metadata.push(ConstMetadataDef {
+										ident: typ.ident.clone(),
+										type_,
+										doc: get_doc_literals(&typ.attrs),
+										attrs: typ.attrs.clone(),
+										value_path: Some(value_path),
+									});
 								} else {
 									return Err(e);
 								}
