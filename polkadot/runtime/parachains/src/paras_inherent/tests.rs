@@ -44,10 +44,6 @@ fn default_config() -> MockGenesisConfig {
 #[cfg(not(feature = "runtime-benchmarks"))]
 mod enter {
 	use super::{inclusion::tests::TestCandidateBuilder, *};
-	use polkadot_primitives::{ApprovedPeerId, ClaimQueueOffset, CoreSelector, UMPSignal};
-	use rstest::rstest;
-	use sp_core::ByteArray;
-
 	use crate::{
 		builder::{Bench, BenchBuilder, CandidateModifier},
 		disputes::clear_dispute_storage,
@@ -62,10 +58,14 @@ mod enter {
 	use frame_support::assert_ok;
 	use frame_system::limits;
 	use polkadot_primitives::{
-		AvailabilityBitfield, CandidateDescriptorV2, CollatorId, CollatorSignature,
-		CommittedCandidateReceiptV2, InternalVersion, MutateDescriptorV2, UncheckedSigned,
+		ApprovedPeerId, AvailabilityBitfield, CandidateDescriptorV2, ClaimQueueOffset, CollatorId,
+		CollatorSignature, CommittedCandidateReceiptV2, CoreSelector, InternalVersion,
+		MutateDescriptorV2, UMPSignal, UncheckedSigned,
 	};
 	use polkadot_primitives_test_helpers::CandidateDescriptor;
+	use pretty_assertions::assert_eq;
+	use rstest::rstest;
+	use sp_core::ByteArray;
 	use sp_runtime::Perbill;
 
 	struct TestConfig {
@@ -1321,10 +1321,14 @@ mod enter {
 
 	#[test]
 	fn disputes_are_size_limited() {
-		BlockLength::set(limits::BlockLength::max_with_normal_ratio(
-			600,
-			Perbill::from_percent(75),
-		));
+		BlockLength::set(
+			limits::BlockLength::builder()
+				.max_length(600)
+				.modify_max_length_for_class(frame_support::dispatch::DispatchClass::Normal, |m| {
+					*m = Perbill::from_percent(75) * 600
+				})
+				.build(),
+		);
 		// Virtually no time based limit:
 		BlockWeights::set(frame_system::limits::BlockWeights::simple_max(Weight::from_parts(
 			u64::MAX,
@@ -1391,10 +1395,14 @@ mod enter {
 
 	#[test]
 	fn bitfields_are_size_limited() {
-		BlockLength::set(limits::BlockLength::max_with_normal_ratio(
-			600,
-			Perbill::from_percent(75),
-		));
+		BlockLength::set(
+			limits::BlockLength::builder()
+				.max_length(600)
+				.modify_max_length_for_class(frame_support::dispatch::DispatchClass::Normal, |m| {
+					*m = Perbill::from_percent(75) * 600
+				})
+				.build(),
+		);
 		// Virtually no time based limit:
 		BlockWeights::set(frame_system::limits::BlockWeights::simple_max(Weight::from_parts(
 			u64::MAX,
@@ -1469,10 +1477,14 @@ mod enter {
 
 	#[test]
 	fn candidates_are_size_limited() {
-		BlockLength::set(limits::BlockLength::max_with_normal_ratio(
-			1_300,
-			Perbill::from_percent(75),
-		));
+		BlockLength::set(
+			limits::BlockLength::builder()
+				.max_length(1_300)
+				.modify_max_length_for_class(frame_support::dispatch::DispatchClass::Normal, |m| {
+					*m = Perbill::from_percent(75) * 1_300
+				})
+				.build(),
+		);
 		// Virtually no time based limit:
 		BlockWeights::set(frame_system::limits::BlockWeights::simple_max(Weight::from_parts(
 			u64::MAX,

@@ -17,237 +17,248 @@
 
 //! The pallet-revive shared VM integration test suite.
 
+use core::iter;
+
 use crate::{
-	test_utils::{builder::Contract, ALICE, ALICE_ADDR},
-	tests::{builder, ExtBuilder, Test},
-	Code, Config, Error,
+	BalanceOf, Code, Config, DelegateInfo, DispatchError, Error, ExecConfig, ExecOrigin,
+	ExecReturnValue, Weight,
+	address::AddressMapper,
+	evm::{decode_revert_reason, fees::InfoT},
+	metering::TransactionLimits,
+	test_utils::{ALICE, ALICE_ADDR, BOB_ADDR, WEIGHT_LIMIT, builder::Contract, deposit_limit},
+	tests::{ExtBuilder, MOCK_CODE, MockHandlerImpl, Test, builder},
 };
 use alloy_core::{
-	primitives::{Bytes, FixedBytes, U256},
-	sol_types::{SolCall, SolInterface},
+	primitives::{Bytes, FixedBytes},
+	sol_types::{Revert, SolCall, SolError, SolInterface},
 };
-use frame_support::{assert_err, traits::fungible::Mutate};
-use pallet_revive_fixtures::{compile_module_with_type, Callee, Caller, FixtureType};
+use frame_support::{
+	assert_err,
+	traits::fungible::{Balanced, Mutate},
+};
+use itertools::Itertools;
+use pallet_revive_fixtures::{Callee, Caller, FixtureType, Host, compile_module_with_type};
+use pallet_revive_uapi::ReturnFlags;
 use pretty_assertions::assert_eq;
-use sp_core::H160;
+use sp_core::{H160, H256};
+use test_case::test_case;
 
 /// Tests that the `CALL` opcode works as expected by having one contract call another.
-#[test]
-fn staticcall_works() {
-	for fixture_type in [FixtureType::Solc, FixtureType::Resolc] {
-		let (caller_code, _) = compile_module_with_type("Caller", fixture_type).unwrap();
-		let (callee_code, _) = compile_module_with_type("Callee", fixture_type).unwrap();
+#[test_case(FixtureType::Solc,   FixtureType::Solc;   "solc->solc")]
+#[test_case(FixtureType::Solc,   FixtureType::Resolc; "solc->resolc")]
+#[test_case(FixtureType::Resolc, FixtureType::Solc;   "resolc->solc")]
+#[test_case(FixtureType::Resolc, FixtureType::Resolc; "resolc->resolc")]
+fn staticcall_works(caller_type: FixtureType, callee_type: FixtureType) {
+	let (caller_code, _) = compile_module_with_type("Caller", caller_type).unwrap();
+	let (callee_code, _) = compile_module_with_type("Callee", callee_type).unwrap();
 
-		ExtBuilder::default().build().execute_with(|| {
-			let _ = <Test as Config>::Currency::set_balance(&ALICE, 100_000_000_000);
+	ExtBuilder::default().build().execute_with(|| {
+		let _ = <Test as Config>::Currency::set_balance(&ALICE, 100_000_000_000);
 
-			// Instantiate the callee contract, which can echo a value.
-			let Contract { addr: callee_addr, .. } =
-				builder::bare_instantiate(Code::Upload(callee_code)).build_and_unwrap_contract();
+		// Instantiate the callee contract, which can echo a value.
+		let Contract { addr: callee_addr, .. } =
+			builder::bare_instantiate(Code::Upload(callee_code)).build_and_unwrap_contract();
 
-			log::info!("Callee  addr: {:?}", callee_addr);
+		// Instantiate the caller contract.
+		let Contract { addr: caller_addr, .. } =
+			builder::bare_instantiate(Code::Upload(caller_code)).build_and_unwrap_contract();
 
-			// Instantiate the caller contract.
-			let Contract { addr: caller_addr, .. } =
-				builder::bare_instantiate(Code::Upload(caller_code)).build_and_unwrap_contract();
+		let magic_number = 42u64;
+		let result = builder::bare_call(caller_addr)
+			.data(
+				Caller::staticCallCall {
+					_callee: callee_addr.0.into(),
+					_data: Callee::echoCall { _data: magic_number }.abi_encode().into(),
+					_gas: u64::MAX,
+				}
+				.abi_encode(),
+			)
+			.build_and_unwrap_result();
 
-			log::info!("Caller  addr: {:?}", caller_addr);
+		let result = Caller::staticCallCall::abi_decode_returns(&result.data).unwrap();
+		assert!(result.success, "the call must succeed");
+		let echo_output = Callee::echoCall::abi_decode_returns(&result.output).unwrap();
+		assert_eq!(magic_number, echo_output, "the call must reproduce the magic number");
 
-			let magic_number = U256::from(42);
-			log::info!("Calling callee from caller");
-			let result = builder::bare_call(caller_addr)
-				.data(
-					Caller::staticCallCall {
-						_callee: callee_addr.0.into(),
-						_data: Callee::echoCall { _data: magic_number }.abi_encode().into(),
-						_gas: U256::MAX,
-					}
-					.abi_encode(),
-				)
-				.build_and_unwrap_result();
+		let result = builder::bare_call(caller_addr)
+			.data(
+				Caller::staticCallCall {
+					_callee: callee_addr.0.into(),
+					_data: Callee::storeCall { _data: magic_number }.abi_encode().into(),
+					_gas: u64::MAX,
+				}
+				.abi_encode(),
+			)
+			.build_and_unwrap_result();
 
-			let result = Caller::staticCallCall::abi_decode_returns(&result.data).unwrap();
-			assert!(result.success, "the call must succeed");
-			assert_eq!(
-				magic_number,
-				U256::from_be_bytes::<32>(result.output.as_ref().try_into().unwrap()),
-				"the call must reproduce the magic number"
-			);
+		let result = Caller::staticCallCall::abi_decode_returns(&result.data).unwrap();
+		assert!(!result.success, "Can not store in static call");
+	});
+}
 
-			let result = builder::bare_call(caller_addr)
-				.data(
-					Caller::staticCallCall {
-						_callee: callee_addr.0.into(),
-						_data: Callee::storeCall { _data: magic_number }.abi_encode().into(),
-						_gas: U256::MAX,
-					}
-					.abi_encode(),
-				)
-				.build_and_unwrap_result();
+#[test_case(FixtureType::Solc,   FixtureType::Solc;   "solc->solc")]
+#[test_case(FixtureType::Solc,   FixtureType::Resolc; "solc->resolc")]
+#[test_case(FixtureType::Resolc, FixtureType::Solc;   "resolc->solc")]
+#[test_case(FixtureType::Resolc, FixtureType::Resolc; "resolc->resolc")]
+fn call_works(caller_type: FixtureType, callee_type: FixtureType) {
+	let (caller_code, _) = compile_module_with_type("Caller", caller_type).unwrap();
+	let (callee_code, _) = compile_module_with_type("Callee", callee_type).unwrap();
 
-			let result = Caller::staticCallCall::abi_decode_returns(&result.data).unwrap();
-			assert!(!result.success, "Can not store in static call");
-		});
-	}
+	ExtBuilder::default().build().execute_with(|| {
+		let _ = <Test as Config>::Currency::set_balance(&ALICE, 100_000_000_000);
+
+		// Instantiate the callee contract, which can echo a value.
+		let Contract { addr: callee_addr, .. } =
+			builder::bare_instantiate(Code::Upload(callee_code)).build_and_unwrap_contract();
+
+		// Instantiate the caller contract.
+		let Contract { addr: caller_addr, .. } =
+			builder::bare_instantiate(Code::Upload(caller_code)).build_and_unwrap_contract();
+
+		let magic_number = 42u64;
+		let result = builder::bare_call(caller_addr)
+			.data(
+				Caller::normalCall {
+					_callee: callee_addr.0.into(),
+					_value: 0,
+					_data: Callee::echoCall { _data: magic_number }.abi_encode().into(),
+					_gas: u64::MAX,
+				}
+				.abi_encode(),
+			)
+			.build_and_unwrap_result();
+
+		let result = Caller::normalCall::abi_decode_returns(&result.data).unwrap();
+		assert!(result.success, "the call must succeed");
+		let echo_output = Callee::echoCall::abi_decode_returns(&result.output).unwrap();
+		assert_eq!(magic_number, echo_output, "the call must reproduce the magic number");
+
+		let result = builder::bare_call(caller_addr)
+			.data(
+				Caller::normalCall {
+					_callee: callee_addr.0.into(),
+					_value: 0,
+					_data: Callee::storeCall { _data: magic_number }.abi_encode().into(),
+					_gas: u64::MAX,
+				}
+				.abi_encode(),
+			)
+			.build_and_unwrap_result();
+
+		let result = Caller::normalCall::abi_decode_returns(&result.data).unwrap();
+		assert!(result.success, "the store call must succeed");
+	});
+}
+
+#[test_case(FixtureType::Solc,   FixtureType::Solc;   "solc->solc")]
+#[test_case(FixtureType::Solc,   FixtureType::Resolc; "solc->resolc")]
+#[test_case(FixtureType::Resolc, FixtureType::Solc;   "resolc->solc")]
+#[test_case(FixtureType::Resolc, FixtureType::Resolc; "resolc->resolc")]
+fn call_revert(caller_type: FixtureType, callee_type: FixtureType) {
+	let (caller_code, _) = compile_module_with_type("Caller", caller_type).unwrap();
+	let (callee_code, _) = compile_module_with_type("Callee", callee_type).unwrap();
+
+	ExtBuilder::default().build().execute_with(|| {
+		let _ = <Test as Config>::Currency::set_balance(&ALICE, 100_000_000_000);
+
+		// Instantiate the callee contract, which can echo a value.
+		let Contract { addr: callee_addr, .. } =
+			builder::bare_instantiate(Code::Upload(callee_code)).build_and_unwrap_contract();
+
+		// Instantiate the caller contract.
+		let Contract { addr: caller_addr, .. } =
+			builder::bare_instantiate(Code::Upload(caller_code)).build_and_unwrap_contract();
+
+		// Call revert and assert failure
+		let result = builder::bare_call(caller_addr)
+			.data(
+				Caller::normalCall {
+					_callee: callee_addr.0.into(),
+					_value: 0,
+					_data: Callee::revertCall {}.abi_encode().into(),
+					_gas: u64::MAX,
+				}
+				.abi_encode(),
+			)
+			.build_and_unwrap_result();
+		let result = Caller::normalCall::abi_decode_returns(&result.data).unwrap();
+		assert!(!result.success, "Call should propagate revert");
+		assert!(result.output.len() > 0, "Returned data should contain revert message");
+
+		let data = result.output.as_ref();
+		if data.len() >= 4 && &data[..4] == Revert::SELECTOR {
+			let reason = decode_revert_reason(data).expect("Failed to decode revert reason");
+			assert_eq!(reason, "revert: This is a revert");
+		} else {
+			panic!("Error selector not found in revert data");
+		}
+	});
 }
 
 #[test]
-fn call_works() {
-	for fixture_type in [FixtureType::Solc, FixtureType::Resolc] {
-		let (caller_code, _) = compile_module_with_type("Caller", fixture_type).unwrap();
-		let (callee_code, _) = compile_module_with_type("Callee", fixture_type).unwrap();
+fn deploy_revert() {
+	let (caller_code, _) = compile_module_with_type("Caller", FixtureType::Solc).unwrap();
 
-		ExtBuilder::default().build().execute_with(|| {
-			let _ = <Test as Config>::Currency::set_balance(&ALICE, 100_000_000_000);
+	ExtBuilder::default().build().execute_with(|| {
+		let _ = <Test as Config>::Currency::set_balance(&ALICE, 100_000_000_000);
 
-			// Instantiate the callee contract, which can echo a value.
-			let Contract { addr: callee_addr, .. } =
-				builder::bare_instantiate(Code::Upload(callee_code)).build_and_unwrap_contract();
+		let Contract { addr: caller_addr, .. } =
+			builder::bare_instantiate(Code::Upload(caller_code)).build_and_unwrap_contract();
 
-			log::info!("Callee  addr: {:?}", callee_addr);
+		let result = builder::bare_call(caller_addr)
+			.data(Caller::createRevertCall {}.abi_encode())
+			.build_and_unwrap_result();
 
-			// Instantiate the caller contract.
-			let Contract { addr: caller_addr, .. } =
-				builder::bare_instantiate(Code::Upload(caller_code)).build_and_unwrap_contract();
-
-			log::info!("Caller  addr: {:?}", caller_addr);
-
-			let magic_number = U256::from(42);
-			log::info!("Calling callee from caller");
-			let result = builder::bare_call(caller_addr)
-				.data(
-					Caller::normalCall {
-						_callee: callee_addr.0.into(),
-						_value: U256::ZERO,
-						_data: Callee::echoCall { _data: magic_number }.abi_encode().into(),
-						_gas: U256::MAX,
-					}
-					.abi_encode(),
-				)
-				.build_and_unwrap_result();
-
-			let result = Caller::normalCall::abi_decode_returns(&result.data).unwrap();
-			assert!(result.success, "the call must succeed");
-			assert_eq!(
-				magic_number,
-				U256::from_be_bytes::<32>(result.output.as_ref().try_into().unwrap()),
-				"the call must reproduce the magic number"
-			);
-
-			let result = builder::bare_call(caller_addr)
-				.data(
-					Caller::normalCall {
-						_callee: callee_addr.0.into(),
-						_value: U256::ZERO,
-						_data: Callee::storeCall { _data: magic_number }.abi_encode().into(),
-						_gas: U256::MAX,
-					}
-					.abi_encode(),
-				)
-				.build_and_unwrap_result();
-
-			let result = Caller::normalCall::abi_decode_returns(&result.data).unwrap();
-			assert!(result.success, "the store call must succeed");
-		});
-	}
-}
-
-#[test]
-fn call_revert() {
-	for fixture_type in [FixtureType::Solc, FixtureType::Resolc] {
-		let (caller_code, _) = compile_module_with_type("Caller", fixture_type).unwrap();
-		let (callee_code, _) = compile_module_with_type("Callee", fixture_type).unwrap();
-
-		ExtBuilder::default().build().execute_with(|| {
-			let _ = <Test as Config>::Currency::set_balance(&ALICE, 100_000_000_000);
-
-			// Instantiate the callee contract, which can echo a value.
-			let Contract { addr: callee_addr, .. } =
-				builder::bare_instantiate(Code::Upload(callee_code)).build_and_unwrap_contract();
-
-			log::info!("Callee  addr: {:?}", callee_addr);
-
-			// Instantiate the caller contract.
-			let Contract { addr: caller_addr, .. } =
-				builder::bare_instantiate(Code::Upload(caller_code)).build_and_unwrap_contract();
-
-			log::info!("Caller  addr: {:?}", caller_addr);
-
-			// Call revert and assert failure
-			let result = builder::bare_call(caller_addr)
-				.data(
-					Caller::normalCall {
-						_callee: callee_addr.0.into(),
-						_value: U256::ZERO,
-						_data: Callee::revertCall {}.abi_encode().into(),
-						_gas: U256::MAX,
-					}
-					.abi_encode(),
-				)
-				.build_and_unwrap_result();
-			let result = Caller::normalCall::abi_decode_returns(&result.data).unwrap();
-			assert!(!result.success, "Call should propagate revert");
-			log::info!("Returned data: {:?}", result.output);
-			assert!(result.output.len() > 0, "Returned data should contain revert message");
-
-			let data = result.output.as_ref();
-
-			// string length
-			let str_len = U256::from_be_slice(&data[36..68]).to::<usize>();
-
-			// string bytes
-			let str_start = 68;
-			let str_end = str_start + str_len;
-			let reason_bytes = &data[str_start..str_end];
-			let reason = std::str::from_utf8(reason_bytes).unwrap();
-			assert_eq!(reason, "This is a revert");
-		});
-	}
+		let data: &[u8] = result.data.as_ref();
+		if data.len() >= 72 && &data[68..72] == Revert::SELECTOR {
+			let reason = decode_revert_reason(&data[68..]).expect("Failed to decode revert reason");
+			assert_eq!(reason, "revert: ChildRevert: revert in constructor");
+		} else {
+			panic!("Error selector not found at expected position 68");
+		}
+	});
 }
 
 // This test has a `caller` contract calling into a `callee` contract which then executes the
 // INVALID opcode. INVALID consumes all gas which means that it will error with OutOfGas.
-#[test]
 #[ignore = "TODO: ignore until we decide what is the correct way to handle this"]
-fn call_invalid_opcode() {
-	for fixture_type in [FixtureType::Resolc, FixtureType::Solc] {
-		let (caller_code, _) = compile_module_with_type("Caller", fixture_type).unwrap();
-		let (callee_code, _) = compile_module_with_type("Callee", fixture_type).unwrap();
+#[test_case(FixtureType::Solc,   FixtureType::Solc;   "solc->solc")]
+#[test_case(FixtureType::Solc,   FixtureType::Resolc; "solc->resolc")]
+#[test_case(FixtureType::Resolc, FixtureType::Solc;   "resolc->solc")]
+#[test_case(FixtureType::Resolc, FixtureType::Resolc; "resolc->resolc")]
+fn call_invalid_opcode(caller_type: FixtureType, callee_type: FixtureType) {
+	let (caller_code, _) = compile_module_with_type("Caller", caller_type).unwrap();
+	let (callee_code, _) = compile_module_with_type("Callee", callee_type).unwrap();
 
-		ExtBuilder::default().build().execute_with(|| {
-			let _ = <Test as Config>::Currency::set_balance(&ALICE, 100_000_000_000);
+	ExtBuilder::default().build().execute_with(|| {
+		let _ = <Test as Config>::Currency::set_balance(&ALICE, 100_000_000_000);
 
-			// Instantiate the callee contract, which can echo a value.
-			let Contract { addr: callee_addr, .. } =
-				builder::bare_instantiate(Code::Upload(callee_code)).build_and_unwrap_contract();
+		// Instantiate the callee contract, which can echo a value.
+		let Contract { addr: callee_addr, .. } =
+			builder::bare_instantiate(Code::Upload(callee_code)).build_and_unwrap_contract();
 
-			log::info!("Callee  addr: {:?}", callee_addr);
+		// Instantiate the caller contract.
+		let Contract { addr: caller_addr, .. } =
+			builder::bare_instantiate(Code::Upload(caller_code)).build_and_unwrap_contract();
 
-			// Instantiate the caller contract.
-			let Contract { addr: caller_addr, .. } =
-				builder::bare_instantiate(Code::Upload(caller_code)).build_and_unwrap_contract();
+		let result = builder::bare_call(caller_addr)
+			.data(
+				Caller::normalCall {
+					_callee: callee_addr.0.into(),
+					_value: 0,
+					_data: Callee::invalidCall {}.abi_encode().into(),
+					_gas: u64::MAX,
+				}
+				.abi_encode(),
+			)
+			.build_and_unwrap_result();
+		let result = Caller::normalCall::abi_decode_returns(&result.data).unwrap();
 
-			log::info!("Caller  addr: {:?}", caller_addr);
+		assert!(!result.success, "Invalid opcode should propagate as error");
 
-			let result = builder::bare_call(caller_addr)
-				.data(
-					Caller::normalCall {
-						_callee: callee_addr.0.into(),
-						_value: U256::ZERO,
-						_data: Callee::invalidCall {}.abi_encode().into(),
-						_gas: U256::MAX,
-					}
-					.abi_encode(),
-				)
-				.build_and_unwrap_result();
-			let result = Caller::normalCall::abi_decode_returns(&result.data).unwrap();
-
-			assert!(!result.success, "Invalid opcode should propagate as error");
-
-			let data = result.output.as_ref();
-			assert!(data.iter().all(|&x| x == 0), "Returned data should be empty")
-		});
-	}
+		let data = result.output.as_ref();
+		assert!(data.iter().all(|&x| x == 0), "Returned data should be empty")
+	});
 }
 
 #[test]
@@ -264,111 +275,326 @@ fn invalid_opcode_evm() {
 		let result = builder::bare_call(callee_addr)
 			.data(Callee::invalidCall {}.abi_encode().into())
 			.build();
-		assert_err!(result.result, <Error<Test>>::InvalidInstruction);
+		assert_err!(result.result, Error::<Test>::InvalidInstruction);
+	});
+}
+
+#[test_case(FixtureType::Solc,   FixtureType::Solc;   "solc->solc")]
+#[test_case(FixtureType::Solc,   FixtureType::Resolc; "solc->resolc")]
+#[test_case(FixtureType::Resolc, FixtureType::Solc;   "resolc->solc")]
+#[test_case(FixtureType::Resolc, FixtureType::Resolc; "resolc->resolc")]
+fn call_stop_opcode(caller_type: FixtureType, callee_type: FixtureType) {
+	let (caller_code, _) = compile_module_with_type("Caller", caller_type).unwrap();
+	let (callee_code, _) = compile_module_with_type("Callee", callee_type).unwrap();
+
+	ExtBuilder::default().build().execute_with(|| {
+		let _ = <Test as Config>::Currency::set_balance(&ALICE, 100_000_000_000);
+
+		// Instantiate the callee contract, which can echo a value.
+		let Contract { addr: callee_addr, .. } =
+			builder::bare_instantiate(Code::Upload(callee_code)).build_and_unwrap_contract();
+
+		// Instantiate the caller contract.
+		let Contract { addr: caller_addr, .. } =
+			builder::bare_instantiate(Code::Upload(caller_code)).build_and_unwrap_contract();
+
+		let result = builder::bare_call(caller_addr)
+			.data(
+				Caller::normalCall {
+					_callee: callee_addr.0.into(),
+					_value: 0,
+					_data: Callee::stopCall {}.abi_encode().into(),
+					_gas: u64::MAX,
+				}
+				.abi_encode(),
+			)
+			.build_and_unwrap_result();
+		let result = Caller::normalCall::abi_decode_returns(&result.data).unwrap();
+
+		assert!(result.success);
+
+		let data = result.output.as_ref();
+		assert!(data.iter().all(|&x| x == 0), "Returned data should be empty")
+	});
+}
+
+#[test_case(FixtureType::Solc,   FixtureType::Solc;   "solc->solc")]
+#[test_case(FixtureType::Solc,   FixtureType::Resolc; "solc->resolc")]
+#[test_case(FixtureType::Resolc, FixtureType::Solc;   "resolc->solc")]
+#[test_case(FixtureType::Resolc, FixtureType::Resolc; "resolc->resolc")]
+fn delegatecall_works(caller_type: FixtureType, callee_type: FixtureType) {
+	let (caller_code, _) = compile_module_with_type("Caller", caller_type).unwrap();
+	let (callee_code, _) = compile_module_with_type("Callee", callee_type).unwrap();
+
+	ExtBuilder::default().build().execute_with(|| {
+		let _ = <Test as Config>::Currency::set_balance(&ALICE, 100_000_000_000);
+
+		// Instantiate the callee contract, which can echo a value.
+		let Contract { addr: callee_addr, .. } =
+			builder::bare_instantiate(Code::Upload(callee_code)).build_and_unwrap_contract();
+
+		// Instantiate the caller contract.
+		let Contract { addr: caller_addr, .. } =
+			builder::bare_instantiate(Code::Upload(caller_code)).build_and_unwrap_contract();
+
+		let magic_number = 42u64;
+		let result = builder::bare_call(caller_addr)
+			.data(
+				Caller::delegateCall {
+					_callee: callee_addr.0.into(),
+					_data: Callee::echoCall { _data: magic_number }.abi_encode().into(),
+					_gas: u64::MAX,
+				}
+				.abi_encode(),
+			)
+			.build_and_unwrap_result();
+
+		let result = Caller::delegateCall::abi_decode_returns(&result.data).unwrap();
+		assert!(result.success, "the call must succeed");
+		let echo_output = Callee::echoCall::abi_decode_returns(&result.output).unwrap();
+		assert_eq!(magic_number, echo_output, "the call must reproduce the magic number");
+
+		let result = builder::bare_call(caller_addr)
+			.data(
+				Caller::delegateCall {
+					_callee: callee_addr.0.into(),
+					_data: Callee::whoSenderCall {}.abi_encode().into(),
+					_gas: u64::MAX,
+				}
+				.abi_encode(),
+			)
+			.build_and_unwrap_result();
+
+		let result = Caller::delegateCall::abi_decode_returns(&result.data).unwrap();
+		assert!(result.success, "the whoSender call must succeed");
+		let decoded = Callee::whoSenderCall::abi_decode_returns(&result.output).unwrap();
+		assert_eq!(ALICE_ADDR, H160::from_slice(decoded.as_slice()));
+	});
+}
+
+#[test_case(FixtureType::Solc,   FixtureType::Solc;   "solc->solc")]
+#[test_case(FixtureType::Solc,   FixtureType::Resolc; "solc->resolc")]
+#[test_case(FixtureType::Resolc, FixtureType::Solc;   "resolc->solc")]
+#[test_case(FixtureType::Resolc, FixtureType::Resolc; "resolc->resolc")]
+fn mock_caller_hook_works(caller_type: FixtureType, callee_type: FixtureType) {
+	let (caller_code, _) = compile_module_with_type("Caller", caller_type).unwrap();
+	let (callee_code, _) = compile_module_with_type("Callee", callee_type).unwrap();
+
+	ExtBuilder::default().build().execute_with(|| {
+		let _ = <Test as Config>::Currency::set_balance(&ALICE, 100_000_000_000);
+
+		// Instantiate the callee contract, which can echo a value.
+		let Contract { addr: callee_addr, .. } =
+			builder::bare_instantiate(Code::Upload(callee_code)).build_and_unwrap_contract();
+
+		// Instantiate the caller contract.
+		let Contract { addr: caller_addr, .. } =
+			builder::bare_instantiate(Code::Upload(caller_code)).build_and_unwrap_contract();
+
+		// Set BOB as the mock caller and check whoSender returns BOB's address.
+		let result = builder::bare_call(caller_addr)
+			.data(
+				Caller::normalCall {
+					_callee: callee_addr.0.into(),
+					_data: Callee::whoSenderCall {}.abi_encode().into(),
+					_gas: u64::MAX,
+					_value: 0,
+				}
+				.abi_encode(),
+			)
+			.exec_config(ExecConfig {
+				mock_handler: Some(Box::new(MockHandlerImpl {
+					mock_caller: Some(BOB_ADDR),
+					..Default::default()
+				})),
+				..Default::default()
+			})
+			.build_and_unwrap_result();
+
+		let result = Caller::normalCall::abi_decode_returns(&result.data).unwrap();
+		assert!(result.success, "the whoSender call must succeed");
+		let decoded = Callee::whoSenderCall::abi_decode_returns(&result.output).unwrap();
+		assert_eq!(BOB_ADDR, H160::from_slice(decoded.as_slice()));
+	});
+}
+
+#[test_case(FixtureType::Solc,   FixtureType::Solc;   "solc->solc")]
+#[test_case(FixtureType::Solc,   FixtureType::Resolc; "solc->resolc")]
+#[test_case(FixtureType::Resolc, FixtureType::Solc;   "resolc->solc")]
+#[test_case(FixtureType::Resolc, FixtureType::Resolc; "resolc->resolc")]
+fn mock_call_hook_works(caller_type: FixtureType, callee_type: FixtureType) {
+	let (caller_code, _) = compile_module_with_type("Caller", caller_type).unwrap();
+	let (callee_code, _) = compile_module_with_type("Callee", callee_type).unwrap();
+
+	ExtBuilder::default().build().execute_with(|| {
+		let _ = <Test as Config>::Currency::set_balance(&ALICE, 100_000_000_000);
+
+		// Instantiate the callee contract, which can echo a value.
+		let Contract { addr: callee_addr, .. } =
+			builder::bare_instantiate(Code::Upload(callee_code)).build_and_unwrap_contract();
+
+		// Instantiate the caller contract.
+		let Contract { addr: caller_addr, .. } =
+			builder::bare_instantiate(Code::Upload(caller_code)).build_and_unwrap_contract();
+
+		// Set up mocked_magic_number to be returned by the mock call handler and check that is
+		// returned instead of magic_number.
+		let magic_number = 42u64;
+		let mocked_magic_number = 99u64;
+		let result = builder::bare_call(caller_addr)
+			.data(
+				Caller::normalCall {
+					_callee: callee_addr.0.into(),
+					_value: 0,
+					_data: Callee::echoCall { _data: magic_number }.abi_encode().into(),
+					_gas: u64::MAX,
+				}
+				.abi_encode(),
+			)
+			.exec_config(ExecConfig {
+				mock_handler: Some(Box::new(MockHandlerImpl {
+					mock_call: iter::once((
+						callee_addr,
+						ExecReturnValue {
+							flags: ReturnFlags::default(),
+							data: alloy_core::sol_types::SolValue::abi_encode(&mocked_magic_number)
+								.into(),
+						},
+					))
+					.collect(),
+					..Default::default()
+				})),
+				..Default::default()
+			})
+			.build_and_unwrap_result();
+
+		let result = Caller::normalCall::abi_decode_returns(&result.data).unwrap();
+		assert!(result.success, "the call must succeed");
+		let echo_output = Callee::echoCall::abi_decode_returns(&result.output).unwrap();
+		assert_eq!(mocked_magic_number, echo_output, "the call must reproduce the magic number");
+	});
+}
+
+#[test_case(FixtureType::Solc,   FixtureType::Solc;   "solc->solc")]
+#[test_case(FixtureType::Solc,   FixtureType::Resolc; "solc->resolc")]
+#[test_case(FixtureType::Resolc, FixtureType::Solc;   "resolc->solc")]
+#[test_case(FixtureType::Resolc, FixtureType::Resolc; "resolc->resolc")]
+fn mock_delegatecall_hook_works(caller_type: FixtureType, callee_type: FixtureType) {
+	let (caller_code, _) = compile_module_with_type("Caller", caller_type).unwrap();
+	let (callee_code, _) = compile_module_with_type("Callee", callee_type).unwrap();
+
+	ExtBuilder::default().build().execute_with(|| {
+		let _ = <Test as Config>::Currency::set_balance(&ALICE, 100_000_000_000);
+
+		// Instantiate the callee contract, which can echo a value.
+		let Contract { addr: callee_addr, .. } =
+			builder::bare_instantiate(Code::Upload(callee_code)).build_and_unwrap_contract();
+
+		// Instantiate the caller contract.
+		let Contract { addr: caller_addr, .. } =
+			builder::bare_instantiate(Code::Upload(caller_code)).build_and_unwrap_contract();
+
+		// Instantiate the call with an invalid callee and check that the delegatecall uses the
+		// mocked callee address.
+		let magic_number = 42u64;
+		let result = builder::bare_call(caller_addr)
+			.data(
+				Caller::normalCall {
+					_callee: caller_addr.0.into(), // Wrong callee, should be overridden by the mock hook.
+					_value: 0,
+					_data: Callee::echoCall { _data: magic_number }.abi_encode().into(),
+					_gas: u64::MAX,
+				}
+				.abi_encode(),
+			)
+			.exec_config(ExecConfig {
+				mock_handler: Some(Box::new(MockHandlerImpl {
+					mock_delegate_caller: iter::once((
+						Callee::echoCall { _data: magic_number }.abi_encode().into(),
+						DelegateInfo {
+							callee: callee_addr,
+							caller: ExecOrigin::<Test>::from_runtime_origin(crate::OriginFor::<Test>::signed(
+								<Test as crate::pallet::Config>::AddressMapper::to_fallback_account_id(
+									&caller_addr,
+								),
+							)).expect("Conversion to ExecOrigin must work"),
+						},
+					))
+					.collect(),
+					..Default::default()
+				})),
+				..Default::default()
+			})
+			.build_and_unwrap_result();
+
+		let result = Caller::normalCall::abi_decode_returns(&result.data).unwrap();
+		assert!(result.success, "the call must succeed");
+		let echo_output = Callee::echoCall::abi_decode_returns(&result.output).unwrap();
+		assert_eq!(magic_number, echo_output, "the call must reproduce the magic number");
 	});
 }
 
 #[test]
-fn call_stop_opcode() {
-	for fixture_type in [FixtureType::Resolc, FixtureType::Solc] {
-		let (caller_code, _) = compile_module_with_type("Caller", fixture_type).unwrap();
-		let (callee_code, _) = compile_module_with_type("Callee", fixture_type).unwrap();
+fn mocked_code_works() {
+	let (host_code, _) = compile_module_with_type("Host", FixtureType::Solc).unwrap();
 
-		ExtBuilder::default().build().execute_with(|| {
-			let _ = <Test as Config>::Currency::set_balance(&ALICE, 100_000_000_000);
+	ExtBuilder::default().build().execute_with(|| {
+		let _ = <Test as Config>::Currency::set_balance(&ALICE, 100_000_000_000);
 
-			// Instantiate the callee contract, which can echo a value.
-			let Contract { addr: callee_addr, .. } =
-				builder::bare_instantiate(Code::Upload(callee_code)).build_and_unwrap_contract();
+		let Contract { addr: host_addr, .. } =
+			builder::bare_instantiate(Code::Upload(host_code)).build_and_unwrap_contract();
 
-			log::info!("Callee  addr: {:?}", callee_addr);
+		let mocked_addr = H160::from_slice(&[0x42; 20]);
 
-			// Instantiate the caller contract.
-			let Contract { addr: caller_addr, .. } =
-				builder::bare_instantiate(Code::Upload(caller_code)).build_and_unwrap_contract();
+		let expected_size = MOCK_CODE.len() as u64;
+		let expected_hash = sp_io::hashing::keccak_256(&MOCK_CODE);
 
-			log::info!("Caller  addr: {:?}", caller_addr);
+		// Test EXTCODESIZE with mocked address
+		let result = builder::bare_call(host_addr)
+			.data(Host::extcodesizeOpCall { account: mocked_addr.0.into() }.abi_encode())
+			.exec_config(ExecConfig {
+				mock_handler: Some(Box::new(MockHandlerImpl {
+					mock_call: iter::once((mocked_addr, ExecReturnValue::default())).collect(),
+					..Default::default()
+				})),
+				..Default::default()
+			})
+			.build_and_unwrap_result();
 
-			let result = builder::bare_call(caller_addr)
-				.data(
-					Caller::normalCall {
-						_callee: callee_addr.0.into(),
-						_value: U256::ZERO,
-						_data: Callee::stopCall {}.abi_encode().into(),
-						_gas: U256::MAX,
-					}
-					.abi_encode(),
-				)
-				.build_and_unwrap_result();
-			let result = Caller::normalCall::abi_decode_returns(&result.data).unwrap();
+		let size = Host::extcodesizeOpCall::abi_decode_returns(&result.data).unwrap();
+		assert_eq!(
+			size, expected_size,
+			"EXTCODESIZE should return {} for mocked address",
+			expected_size
+		);
 
-			assert!(result.success);
+		// Test EXTCODEHASH with mocked address
+		let result = builder::bare_call(host_addr)
+			.data(Host::extcodehashOpCall { account: mocked_addr.0.into() }.abi_encode())
+			.exec_config(ExecConfig {
+				mock_handler: Some(Box::new(MockHandlerImpl {
+					mock_call: iter::once((mocked_addr, ExecReturnValue::default())).collect(),
+					..Default::default()
+				})),
+				..Default::default()
+			})
+			.build_and_unwrap_result();
 
-			let data = result.output.as_ref();
-			assert!(data.iter().all(|&x| x == 0), "Returned data should be empty")
-		});
-	}
-}
+		let hash = Host::extcodehashOpCall::abi_decode_returns(&result.data).unwrap();
+		assert_eq!(
+			H256::from_slice(hash.as_slice()),
+			H256::from_slice(&expected_hash),
+			"EXTCODEHASH should return keccak256(MOCK_CODE) for mocked address"
+		);
 
-#[test]
-fn delegatecall_works() {
-	for fixture_type in [FixtureType::Solc, FixtureType::Resolc] {
-		let (caller_code, _) = compile_module_with_type("Caller", fixture_type).unwrap();
-		let (callee_code, _) = compile_module_with_type("Callee", fixture_type).unwrap();
+		// Verify that without mock handler, the same address returns 0 for code size
+		let result = builder::bare_call(host_addr)
+			.data(Host::extcodesizeOpCall { account: mocked_addr.0.into() }.abi_encode())
+			.build_and_unwrap_result();
 
-		ExtBuilder::default().build().execute_with(|| {
-			let _ = <Test as Config>::Currency::set_balance(&ALICE, 100_000_000_000);
-
-			// Instantiate the callee contract, which can echo a value.
-			let Contract { addr: callee_addr, .. } =
-				builder::bare_instantiate(Code::Upload(callee_code)).build_and_unwrap_contract();
-
-			log::info!("Callee  addr: {:?}", callee_addr);
-
-			// Instantiate the caller contract.
-			let Contract { addr: caller_addr, .. } =
-				builder::bare_instantiate(Code::Upload(caller_code)).build_and_unwrap_contract();
-
-			log::info!("Caller  addr: {:?}", caller_addr);
-
-			let magic_number = U256::from(42);
-			log::info!("Calling callee.echo() from caller");
-			let result = builder::bare_call(caller_addr)
-				.data(
-					Caller::delegateCall {
-						_callee: callee_addr.0.into(),
-						_data: Callee::echoCall { _data: magic_number }.abi_encode().into(),
-						_gas: U256::MAX,
-					}
-					.abi_encode(),
-				)
-				.build_and_unwrap_result();
-
-			let result = Caller::delegateCall::abi_decode_returns(&result.data).unwrap();
-			assert!(result.success, "the call must succeed");
-			assert_eq!(
-				magic_number,
-				U256::from_be_bytes::<32>(result.output.as_ref().try_into().unwrap()),
-				"the call must reproduce the magic number"
-			);
-
-			log::info!("Calling callee.whoSender() from caller");
-			let result = builder::bare_call(caller_addr)
-				.data(
-					Caller::delegateCall {
-						_callee: callee_addr.0.into(),
-						_data: Callee::whoSenderCall {}.abi_encode().into(),
-						_gas: U256::MAX,
-					}
-					.abi_encode(),
-				)
-				.build_and_unwrap_result();
-
-			let result = Caller::delegateCall::abi_decode_returns(&result.data).unwrap();
-			assert!(result.success, "the whoSender call must succeed");
-			assert_eq!(ALICE_ADDR, H160::from_slice(&result.output.as_ref()[12..]));
-		});
-	}
+		let size = Host::extcodesizeOpCall::abi_decode_returns(&result.data).unwrap();
+		assert_eq!(size, 0, "EXTCODESIZE should return 0 for unmocked address without code");
+	});
 }
 
 #[test]
@@ -391,13 +617,10 @@ fn create_works() {
 			.build_and_unwrap_result();
 
 		let callee_addr = Caller::createCall::abi_decode_returns(&result.data).unwrap();
-
-		log::info!("Created  addr: {:?}", callee_addr);
-
-		let magic_number = U256::from(42);
+		let magic_number = 42u64;
 
 		// Check if the created contract is working
-		let echo_result = builder::bare_call(callee_addr.0 .0.into())
+		let echo_result = builder::bare_call(callee_addr.0.0.into())
 			.data(Callee::echoCall { _data: magic_number }.abi_encode())
 			.build_and_unwrap_result();
 
@@ -418,7 +641,7 @@ fn create2_works() {
 		let Contract { addr: caller_addr, .. } =
 			builder::bare_instantiate(Code::Upload(caller_code)).build_and_unwrap_contract();
 
-		let salt = U256::from(42).to_be_bytes();
+		let salt = [42u8; 32];
 
 		let initcode = Bytes::from(callee_code);
 		// Prepare the CREATE2 call
@@ -432,16 +655,12 @@ fn create2_works() {
 
 		let callee_addr = Caller::create2Call::abi_decode_returns(&result.data).unwrap();
 
-		log::info!("Created  addr: {:?}", callee_addr);
-
 		// Compute expected CREATE2 address
 		let expected_addr = crate::address::create2(&caller_addr, &initcode, &[], &salt);
 
-		let callee_addr: H160 = callee_addr.0 .0.into();
-
+		let callee_addr: H160 = callee_addr.0.0.into();
 		assert_eq!(callee_addr, expected_addr, "CREATE2 address should be deterministic");
-
-		let magic_number = U256::from(42);
+		let magic_number = 42u64;
 
 		// Check if the created contract is working
 		let echo_result = builder::bare_call(callee_addr)
@@ -470,6 +689,130 @@ fn instantiate_from_constructor_works() {
 		let data = CallerWithConstructorCalls::callBar(callBarCall {}).abi_encode();
 		let result = builder::bare_call(addr).data(data).build_and_unwrap_result();
 		let result = callBarCall::abi_decode_returns(&result.data).unwrap();
-		assert_eq!(result, U256::from(42));
+		assert_eq!(result, 42u64);
 	});
+}
+
+/// No resolc caller since the subcall limiting is not implemented on resolc, yet.
+#[test_case(FixtureType::Solc,   FixtureType::Solc;   "solc->solc")]
+#[test_case(FixtureType::Solc,   FixtureType::Resolc; "solc->resolc")]
+fn subcall_effectively_limited_substrate_tx(caller_type: FixtureType, callee_type: FixtureType) {
+	let (caller_code, _) = compile_module_with_type("Caller", caller_type).unwrap();
+	let (callee_code, _) = compile_module_with_type("Callee", callee_type).unwrap();
+
+	let no_collection_config = ExecConfig::new_substrate_tx();
+	let mut collection_config = ExecConfig::new_substrate_tx();
+	collection_config.collect_deposit_from_hold = Some(Default::default());
+	let configs = [no_collection_config, collection_config];
+
+	let call_types =
+		[Caller::CallType::Call, Caller::CallType::StaticCall, Caller::CallType::DelegateCall];
+
+	struct Case {
+		deposit_limit: BalanceOf<Test>,
+		gas_divisor: u64,
+		callee_input: Vec<u8>,
+		result: Result<bool, DispatchError>,
+		is_store_call: bool,
+	}
+
+	let test_cases = [
+		Case {
+			deposit_limit: deposit_limit::<Test>(),
+			gas_divisor: 1,
+			callee_input: Callee::consumeAllReftimeCall {}.abi_encode(),
+			result: Err(<Error<Test>>::OutOfGas.into()),
+			is_store_call: false,
+		},
+		Case {
+			deposit_limit: deposit_limit::<Test>(),
+			gas_divisor: 2,
+			callee_input: Callee::consumeAllReftimeCall {}.abi_encode(),
+			result: Ok(false),
+			is_store_call: false,
+		},
+		Case {
+			deposit_limit: deposit_limit::<Test>(),
+			gas_divisor: u64::MAX,
+			callee_input: Callee::consumeAllReftimeCall {}.abi_encode(),
+			result: Ok(false),
+			is_store_call: false,
+		},
+		Case {
+			deposit_limit: 130,
+			gas_divisor: 1,
+			callee_input: Callee::storeCall { _data: 42 }.abi_encode(),
+			result: Err(<Error<Test>>::StorageDepositLimitExhausted.into()),
+			is_store_call: true,
+		},
+		Case {
+			deposit_limit: 130,
+			gas_divisor: 2,
+			callee_input: Callee::storeCall { _data: 42 }.abi_encode(),
+			result: Ok(false),
+			is_store_call: true,
+		},
+		Case {
+			deposit_limit: 130,
+			gas_divisor: u64::MAX,
+			callee_input: Callee::storeCall { _data: 42 }.abi_encode(),
+			result: Ok(false),
+			is_store_call: true,
+		},
+		Case {
+			deposit_limit: deposit_limit::<Test>(),
+			gas_divisor: 2,
+			callee_input: Callee::storeCall { _data: 42 }.abi_encode(),
+			result: Ok(true),
+			is_store_call: true,
+		},
+	];
+
+	for ((case, config), call_type) in
+		test_cases.iter().cartesian_product(&configs).cartesian_product(call_types)
+	{
+		// the storage stuff won't work on static or delegate call
+		if case.is_store_call && !matches!(call_type, Caller::CallType::Call) {
+			continue;
+		}
+
+		ExtBuilder::default().build().execute_with(|| {
+			let _ = <Test as Config>::Currency::set_balance(&ALICE, 100_000_000_000);
+			let fees = <Test as Config>::FeeInfo::tx_fee_from_weight(0, &WEIGHT_LIMIT) +
+				case.deposit_limit;
+			<Test as Config>::FeeInfo::deposit_txfee(<Test as Config>::Currency::issue(fees));
+
+			// Instantiate the callee contract, which can echo a value.
+			let Contract { addr: callee_addr, .. } =
+				builder::bare_instantiate(Code::Upload(callee_code.clone()))
+					.build_and_unwrap_contract();
+
+			// Instantiate the caller contract.
+			let Contract { addr: caller_addr, .. } =
+				builder::bare_instantiate(Code::Upload(caller_code.clone()))
+					.build_and_unwrap_contract();
+
+			let output = builder::bare_call(caller_addr)
+				.data(
+					Caller::callPartialGasCall {
+						_callee: callee_addr.0.into(),
+						_data: case.callee_input.clone().into(),
+						_gasDivisor: case.gas_divisor,
+						_callType: call_type,
+					}
+					.abi_encode(),
+				)
+				.exec_config(config.clone())
+				.transaction_limits(TransactionLimits::WeightAndDeposit {
+					weight_limit: Weight::from_parts(50_000_000_000, 10 * 1024 * 1024),
+					deposit_limit: case.deposit_limit,
+				})
+				.build();
+
+			let result = output.result.map(|result| {
+				Caller::callPartialGasCall::abi_decode_returns(&result.data).unwrap()
+			});
+			assert_eq!(case.result, result);
+		});
+	}
 }

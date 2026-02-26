@@ -197,7 +197,7 @@ pub trait RuntimeApiSubsystemClient {
 	async fn on_chain_votes(&self, at: Hash)
 		-> Result<Option<ScrapedOnChainVotes<Hash>>, ApiError>;
 
-	/***** Added in v2 **** */
+	/// *** Added in v2 ****
 
 	/// Get the session info for the given session, if stored.
 	///
@@ -234,7 +234,7 @@ pub trait RuntimeApiSubsystemClient {
 		assumption: OccupiedCoreAssumption,
 	) -> Result<Option<ValidationCodeHash>, ApiError>;
 
-	/***** Added in v3 **** */
+	/// *** Added in v3 ****
 
 	/// Returns all onchain disputes.
 	async fn disputes(
@@ -246,7 +246,7 @@ pub trait RuntimeApiSubsystemClient {
 	async fn unapplied_slashes(
 		&self,
 		at: Hash,
-	) -> Result<Vec<(SessionIndex, CandidateHash, slashing::PendingSlashes)>, ApiError>;
+	) -> Result<Vec<(SessionIndex, CandidateHash, slashing::LegacyPendingSlashes)>, ApiError>;
 
 	/// Returns a merkle proof of a validator session key in a past session.
 	async fn key_ownership_proof(
@@ -357,6 +357,13 @@ pub trait RuntimeApiSubsystemClient {
 	// == v14 ==
 	/// Fetch the list of all parachain IDs registered in the relay chain.
 	async fn para_ids(&self, at: Hash) -> Result<Vec<Id>, ApiError>;
+
+	// == v15 ==
+	/// Returns a list of validators that lost a past session dispute and need to be slashed (v2).
+	async fn unapplied_slashes_v2(
+		&self,
+		at: Hash,
+	) -> Result<Vec<(SessionIndex, CandidateHash, slashing::PendingSlashes)>, ApiError>;
 }
 
 /// Default implementation of [`RuntimeApiSubsystemClient`] using the client.
@@ -564,8 +571,15 @@ where
 	async fn unapplied_slashes(
 		&self,
 		at: Hash,
-	) -> Result<Vec<(SessionIndex, CandidateHash, slashing::PendingSlashes)>, ApiError> {
+	) -> Result<Vec<(SessionIndex, CandidateHash, slashing::LegacyPendingSlashes)>, ApiError> {
 		self.client.runtime_api().unapplied_slashes(at)
+	}
+
+	async fn unapplied_slashes_v2(
+		&self,
+		at: Hash,
+	) -> Result<Vec<(SessionIndex, CandidateHash, slashing::PendingSlashes)>, ApiError> {
+		self.client.runtime_api().unapplied_slashes_v2(at)
 	}
 
 	async fn key_ownership_proof(

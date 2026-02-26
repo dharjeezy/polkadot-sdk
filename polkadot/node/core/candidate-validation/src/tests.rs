@@ -1179,7 +1179,7 @@ fn candidate_validation_retry_on_error_helper(
 		&Default::default(),
 		Default::default(),
 		VALIDATION_CODE_BOMB_LIMIT,
-	))
+	));
 }
 
 #[test]
@@ -1342,7 +1342,7 @@ fn compressed_code_works() {
 
 	let raw_code = vec![2u8; 16];
 	let validation_code =
-		sp_maybe_compressed_blob::compress(&raw_code, VALIDATION_CODE_BOMB_LIMIT as usize)
+		sp_maybe_compressed_blob::compress_strongly(&raw_code, VALIDATION_CODE_BOMB_LIMIT as usize)
 			.map(ValidationCode)
 			.unwrap();
 

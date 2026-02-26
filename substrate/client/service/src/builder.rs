@@ -22,8 +22,8 @@ use crate::{
 	config::{Configuration, ExecutorConfiguration, KeystoreConfig, Multiaddr, PrometheusConfig},
 	error::Error,
 	metrics::MetricsService,
-	start_rpc_servers, BuildGenesisBlock, GenesisBlockBuilder, RpcHandlers, SpawnTaskHandle,
-	TaskManager, TransactionPoolAdapter,
+	start_rpc_servers, BuildGenesisBlock, GenesisBlockBuilder, RpcHandlers,
+	SpawnEssentialTaskHandle, SpawnTaskHandle, TaskManager, TransactionPoolAdapter,
 };
 use futures::{select, FutureExt, StreamExt};
 use jsonrpsee::RpcModule;
@@ -81,6 +81,7 @@ use sc_rpc_spec_v2::{
 	transaction::{TransactionApiServer, TransactionBroadcastApiServer},
 };
 use sc_telemetry::{telemetry, ConnectionMessage, Telemetry, TelemetryHandle, SUBSTRATE_INFO};
+use sc_tracing::block::TracingExecuteBlock;
 use sc_transaction_pool_api::{MaintainedTransactionPool, TransactionPool};
 use sc_utils::mpsc::{tracing_unbounded, TracingUnboundedSender};
 use sp_api::{CallApiAt, ProvideRuntimeApi};
@@ -118,8 +119,9 @@ impl KeystoreContainer {
 	/// Construct KeystoreContainer
 	pub fn new(config: &KeystoreConfig) -> Result<Self, Error> {
 		let keystore = Arc::new(match config {
-			KeystoreConfig::Path { path, password } =>
-				LocalKeystore::open(path.clone(), password.clone())?,
+			KeystoreConfig::Path { path, password } => {
+				LocalKeystore::open(path.clone(), password.clone())?
+			},
 			KeystoreConfig::InMemory => LocalKeystore::in_memory(),
 		});
 
@@ -142,26 +144,33 @@ pub fn new_full_client<TBl, TRtApi, TExec>(
 	config: &Configuration,
 	telemetry: Option<TelemetryHandle>,
 	executor: TExec,
+	pruning_filters: Vec<Arc<dyn sc_client_db::PruningFilter>>,
 ) -> Result<TFullClient<TBl, TRtApi, TExec>, Error>
 where
 	TBl: BlockT,
 	TExec: CodeExecutor + RuntimeVersionOf + Clone,
 {
-	new_full_parts(config, telemetry, executor).map(|parts| parts.0)
+	new_full_parts(config, telemetry, executor, pruning_filters).map(|parts| parts.0)
 }
 
 /// Create the initial parts of a full node with the default genesis block builder.
+///
+/// The `pruning_filters` parameter allows configuring which blocks should be preserved
+/// during pruning.
 pub fn new_full_parts_record_import<TBl, TRtApi, TExec>(
 	config: &Configuration,
 	telemetry: Option<TelemetryHandle>,
 	executor: TExec,
 	enable_import_proof_recording: bool,
+	pruning_filters: Vec<Arc<dyn sc_client_db::PruningFilter>>,
 ) -> Result<TFullParts<TBl, TRtApi, TExec>, Error>
 where
 	TBl: BlockT,
 	TExec: CodeExecutor + RuntimeVersionOf + Clone,
 {
-	let backend = new_db_backend(config.db_config())?;
+	let mut db_config = config.db_config();
+	db_config.pruning_filters = pruning_filters;
+	let backend = new_db_backend(db_config)?;
 
 	let genesis_block_builder = GenesisBlockBuilder::new(
 		config.chain_spec.as_storage_builder(),
@@ -179,17 +188,22 @@ where
 		enable_import_proof_recording,
 	)
 }
+
 /// Create the initial parts of a full node with the default genesis block builder.
+///
+/// The `pruning_filters` parameter allows configuring which blocks should be preserved
+/// during pruning.
 pub fn new_full_parts<TBl, TRtApi, TExec>(
 	config: &Configuration,
 	telemetry: Option<TelemetryHandle>,
 	executor: TExec,
+	pruning_filters: Vec<Arc<dyn sc_client_db::PruningFilter>>,
 ) -> Result<TFullParts<TBl, TRtApi, TExec>, Error>
 where
 	TBl: BlockT,
 	TExec: CodeExecutor + RuntimeVersionOf + Clone,
 {
-	new_full_parts_record_import(config, telemetry, executor, false)
+	new_full_parts_record_import(config, telemetry, executor, false, pruning_filters)
 }
 
 /// Create the initial parts of a full node.
@@ -373,7 +387,10 @@ pub fn new_wasm_executor<H: HostFunctions>(config: &ExecutorConfiguration) -> Wa
 		.build()
 }
 
-/// Create an instance of default DB-backend backend.
+/// Create an instance of the default DB-backend.
+///
+/// Pruning filters can be configured via `settings.pruning_filters`.
+/// If any filter returns `true` for a block's justifications, the block will not be pruned.
 pub fn new_db_backend<Block>(
 	settings: DatabaseSettings,
 ) -> Result<Arc<Backend<Block>>, sp_blockchain::Error>
@@ -461,11 +478,29 @@ pub struct SpawnTasksParams<'a, TBl: BlockT, TCl, TExPool, TRpc, Backend> {
 	pub sync_service: Arc<SyncingService<TBl>>,
 	/// Telemetry instance for this node.
 	pub telemetry: Option<&'a mut Telemetry>,
+	/// Optional [`TracingExecuteBlock`] handle.
+	///
+	/// Will be used by the `trace_block` RPC to execute the actual block.
+	pub tracing_execute_block: Option<Arc<dyn TracingExecuteBlock<TBl>>>,
 }
 
 /// Spawn the tasks that are required to run a node.
 pub fn spawn_tasks<TBl, TBackend, TExPool, TRpc, TCl>(
-	params: SpawnTasksParams<TBl, TCl, TExPool, TRpc, TBackend>,
+	SpawnTasksParams {
+		mut config,
+		task_manager,
+		client,
+		backend,
+		keystore,
+		transaction_pool,
+		rpc_builder,
+		network,
+		system_rpc_tx,
+		tx_handler_controller,
+		sync_service,
+		telemetry,
+		tracing_execute_block: execute_block,
+	}: SpawnTasksParams<TBl, TCl, TExPool, TRpc, TBackend>,
 ) -> Result<RpcHandlers, Error>
 where
 	TCl: ProvideRuntimeApi<TBl>
@@ -492,21 +527,6 @@ where
 	TBackend: 'static + sc_client_api::backend::Backend<TBl> + Send,
 	TExPool: MaintainedTransactionPool<Block = TBl, Hash = <TBl as BlockT>::Hash> + 'static,
 {
-	let SpawnTasksParams {
-		mut config,
-		task_manager,
-		client,
-		backend,
-		keystore,
-		transaction_pool,
-		rpc_builder,
-		network,
-		system_rpc_tx,
-		tx_handler_controller,
-		sync_service,
-		telemetry,
-	} = params;
-
 	let chain_info = client.usage_info().chain;
 
 	sp_session::generate_initial_session_keys(
@@ -603,21 +623,22 @@ where
 		.transpose()?;
 
 	let gen_rpc_module = || {
-		gen_rpc_module(
-			task_manager.spawn_handle(),
-			client.clone(),
-			transaction_pool.clone(),
-			keystore.clone(),
-			system_rpc_tx.clone(),
-			config.impl_name.clone(),
-			config.impl_version.clone(),
-			config.chain_spec.as_ref(),
-			&config.state_pruning,
-			config.blocks_pruning,
-			backend.clone(),
-			&*rpc_builder,
-			rpc_v2_metrics.clone(),
-		)
+		gen_rpc_module(GenRpcModuleParams {
+			spawn_handle: task_manager.spawn_handle(),
+			client: client.clone(),
+			transaction_pool: transaction_pool.clone(),
+			keystore: keystore.clone(),
+			system_rpc_tx: system_rpc_tx.clone(),
+			impl_name: config.impl_name.clone(),
+			impl_version: config.impl_version.clone(),
+			chain_spec: config.chain_spec.as_ref(),
+			state_pruning: &config.state_pruning,
+			blocks_pruning: config.blocks_pruning,
+			backend: backend.clone(),
+			rpc_builder: &*rpc_builder,
+			metrics: rpc_v2_metrics.clone(),
+			tracing_execute_block: execute_block.clone(),
+		})
 	};
 
 	let rpc_server_handle = start_rpc_servers(
@@ -750,21 +771,58 @@ where
 	Ok(telemetry.handle())
 }
 
+/// Parameters for [`gen_rpc_module`].
+pub struct GenRpcModuleParams<'a, TBl: BlockT, TBackend, TCl, TRpc, TExPool> {
+	/// The handle to spawn tasks.
+	pub spawn_handle: SpawnTaskHandle,
+	/// Access to the client.
+	pub client: Arc<TCl>,
+	/// The transaction pool.
+	pub transaction_pool: Arc<TExPool>,
+	/// Keystore handle.
+	pub keystore: KeystorePtr,
+	/// Sender for system requests.
+	pub system_rpc_tx: TracingUnboundedSender<sc_rpc::system::Request<TBl>>,
+	/// Implementation name of this node.
+	pub impl_name: String,
+	/// Implementation version of this node.
+	pub impl_version: String,
+	/// The chain spec.
+	pub chain_spec: &'a dyn ChainSpec,
+	/// Enabled pruning mode for this node.
+	pub state_pruning: &'a Option<PruningMode>,
+	/// Enabled blocks pruning mode.
+	pub blocks_pruning: BlocksPruning,
+	/// Backend of the node.
+	pub backend: Arc<TBackend>,
+	/// RPC builder.
+	pub rpc_builder: &'a dyn Fn(SubscriptionTaskExecutor) -> Result<RpcModule<TRpc>, Error>,
+	/// Transaction metrics handle.
+	pub metrics: Option<sc_rpc_spec_v2::transaction::TransactionMetrics>,
+	/// Optional [`TracingExecuteBlock`] handle.
+	///
+	/// Will be used by the `trace_block` RPC to execute the actual block.
+	pub tracing_execute_block: Option<Arc<dyn TracingExecuteBlock<TBl>>>,
+}
+
 /// Generate RPC module using provided configuration
 pub fn gen_rpc_module<TBl, TBackend, TCl, TRpc, TExPool>(
-	spawn_handle: SpawnTaskHandle,
-	client: Arc<TCl>,
-	transaction_pool: Arc<TExPool>,
-	keystore: KeystorePtr,
-	system_rpc_tx: TracingUnboundedSender<sc_rpc::system::Request<TBl>>,
-	impl_name: String,
-	impl_version: String,
-	chain_spec: &dyn ChainSpec,
-	state_pruning: &Option<PruningMode>,
-	blocks_pruning: BlocksPruning,
-	backend: Arc<TBackend>,
-	rpc_builder: &(dyn Fn(SubscriptionTaskExecutor) -> Result<RpcModule<TRpc>, Error>),
-	metrics: Option<sc_rpc_spec_v2::transaction::TransactionMetrics>,
+	GenRpcModuleParams {
+		spawn_handle,
+		client,
+		transaction_pool,
+		keystore,
+		system_rpc_tx,
+		impl_name,
+		impl_version,
+		chain_spec,
+		state_pruning,
+		blocks_pruning,
+		backend,
+		rpc_builder,
+		metrics,
+		tracing_execute_block: execute_block,
+	}: GenRpcModuleParams<TBl, TBackend, TCl, TRpc, TExPool>,
 ) -> Result<RpcModule<()>, Error>
 where
 	TBl: BlockT,
@@ -799,7 +857,8 @@ where
 
 	let (chain, state, child_state) = {
 		let chain = sc_rpc::chain::new_full(client.clone(), task_executor.clone()).into_rpc();
-		let (state, child_state) = sc_rpc::state::new_full(client.clone(), task_executor.clone());
+		let (state, child_state) =
+			sc_rpc::state::new_full(client.clone(), task_executor.clone(), execute_block);
 		let state = state.into_rpc();
 		let child_state = child_state.into_rpc();
 
@@ -912,6 +971,8 @@ where
 	pub transaction_pool: Arc<TxPool>,
 	/// A handle for spawning tasks.
 	pub spawn_handle: SpawnTaskHandle,
+	/// A handle for spawning essential tasks.
+	pub spawn_essential_handle: SpawnEssentialTaskHandle,
 	/// An import queue.
 	pub import_queue: IQ,
 	/// A block announce validator builder.
@@ -960,6 +1021,7 @@ where
 		client,
 		transaction_pool,
 		spawn_handle,
+		spawn_essential_handle,
 		import_queue,
 		block_announce_validator_builder,
 		warp_sync_config,
@@ -1011,6 +1073,7 @@ where
 		client.clone(),
 		&spawn_handle,
 		metrics_registry,
+		config.blocks_pruning.is_archive(),
 	)?;
 
 	let (syncing_engine, sync_service, block_announce_config) = SyncingEngine::new(
@@ -1040,6 +1103,7 @@ where
 		client,
 		transaction_pool,
 		spawn_handle,
+		spawn_essential_handle,
 		import_queue,
 		sync_service,
 		block_announce_config,
@@ -1073,6 +1137,8 @@ where
 	pub transaction_pool: Arc<TxPool>,
 	/// A handle for spawning tasks.
 	pub spawn_handle: SpawnTaskHandle,
+	/// A handle for spawning essential tasks.
+	pub spawn_essential_handle: SpawnEssentialTaskHandle,
 	/// An import queue.
 	pub import_queue: IQ,
 	/// Syncing service to communicate with syncing engine.
@@ -1125,6 +1191,7 @@ where
 		client,
 		transaction_pool,
 		spawn_handle,
+		spawn_essential_handle,
 		import_queue,
 		sync_service,
 		block_announce_config,
@@ -1243,7 +1310,10 @@ where
 	// issue, and ideally we would like to fix the network future to take as little time as
 	// possible, but we also take the extra harm-prevention measure to execute the networking
 	// future using `spawn_blocking`.
-	spawn_handle.spawn_blocking("network-worker", Some("networking"), future);
+	//
+	// The network worker is spawned as an essential task, meaning if it exits unexpectedly
+	// the service will shut down.
+	spawn_essential_handle.spawn_blocking("network-worker", Some("networking"), future);
 
 	Ok((network, system_rpc_tx, tx_handler_controller, sync_service.clone()))
 }
@@ -1280,6 +1350,9 @@ where
 	pub metrics_registry: Option<&'a Registry>,
 	/// Metrics.
 	pub metrics: NotificationMetrics,
+	/// Whether to archive blocks. When `true`, gap sync requests bodies to maintain complete
+	/// block history.
+	pub archive_blocks: bool,
 }
 
 /// Build default syncing engine using [`build_default_block_downloader`] and
@@ -1312,6 +1385,7 @@ where
 		spawn_handle,
 		metrics_registry,
 		metrics,
+		archive_blocks,
 	} = config;
 
 	let block_downloader = build_default_block_downloader(
@@ -1332,6 +1406,7 @@ where
 		client.clone(),
 		spawn_handle,
 		metrics_registry,
+		archive_blocks,
 	)?;
 
 	let (syncing_engine, sync_service, block_announce_config) = SyncingEngine::new(
@@ -1399,6 +1474,7 @@ pub fn build_polkadot_syncing_strategy<Block, Client, Net>(
 	client: Arc<Client>,
 	spawn_handle: &SpawnTaskHandle,
 	metrics_registry: Option<&Registry>,
+	archive_blocks: bool,
 ) -> Result<Box<dyn SyncingStrategy<Block>>, Error>
 where
 	Block: BlockT,
@@ -1412,13 +1488,14 @@ where
 	Net: NetworkBackend<Block, <Block as BlockT>::Hash>,
 {
 	if warp_sync_config.is_none() && net_config.network_config.sync_mode.is_warp() {
-		return Err("Warp sync enabled, but no warp sync provider configured.".into())
+		return Err("Warp sync enabled, but no warp sync provider configured.".into());
 	}
 
 	if client.requires_full_sync() {
 		match net_config.network_config.sync_mode {
-			SyncMode::LightState { .. } =>
-				return Err("Fast sync doesn't work for archive nodes".into()),
+			SyncMode::LightState { .. } => {
+				return Err("Fast sync doesn't work for archive nodes".into())
+			},
 			SyncMode::Warp => return Err("Warp sync doesn't work for archive nodes".into()),
 			SyncMode::Full => {},
 		}
@@ -1467,6 +1544,7 @@ where
 		metrics_registry: metrics_registry.cloned(),
 		state_request_protocol_name,
 		block_downloader,
+		archive_blocks,
 	};
 	Ok(Box::new(PolkadotSyncingStrategy::new(
 		syncing_config,

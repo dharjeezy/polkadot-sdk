@@ -15,35 +15,70 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+mod block_hash;
 mod pallet_dummy;
 mod precompiles;
 mod pvm;
 mod sol;
+mod stipends;
+
+use std::collections::HashMap;
 
 use crate::{
-	self as pallet_revive,
+	self as pallet_revive, AccountId32Mapper, AddressMapper, BalanceOf, BalanceWithDust, Call,
+	CodeInfoOf, Config, DelegateInfo, ExecOrigin as Origin, ExecReturnValue, GenesisConfig,
+	OriginFor, Pallet, PristineCode,
+	evm::{
+		fees::{BlockRatioFee, Info as FeeInfo},
+		runtime::{EthExtra, SetWeightLimit},
+	},
 	genesis::{Account, ContractData},
+	mock::MockHandler,
 	test_utils::*,
-	AccountId32Mapper, AddressMapper, BalanceOf, BalanceWithDust, CodeInfoOf, Config,
-	GenesisConfig, Origin, Pallet, PristineCode,
 };
 use frame_support::{
-	assert_ok, derive_impl,
+	DefaultNoBound, assert_ok, derive_impl,
 	pallet_prelude::EnsureOrigin,
 	parameter_types,
-	traits::{ConstU32, ConstU64, FindAuthor, StorageVersion},
-	weights::{constants::WEIGHT_REF_TIME_PER_SECOND, FixedFee, IdentityFee, Weight},
+	traits::{ConstU32, ConstU64, FindAuthor, OriginTrait, StorageVersion},
+	weights::{FixedFee, Weight, constants::WEIGHT_REF_TIME_PER_SECOND},
 };
 use pallet_revive_fixtures::compile_module;
-use pallet_transaction_payment::{ConstFeeMultiplier, Multiplier};
-use sp_core::U256;
-use sp_keystore::{testing::MemoryKeystore, KeystoreExt};
+use pallet_transaction_payment::{ChargeTransactionPayment, ConstFeeMultiplier, Multiplier};
+use sp_core::{H160, U256};
+use sp_keystore::{KeystoreExt, testing::MemoryKeystore};
 use sp_runtime::{
+	AccountId32, BuildStorage, FixedU128, MultiAddress, MultiSignature, Perbill, Storage,
+	generic::Header,
 	traits::{BlakeTwo256, Convert, IdentityLookup, One},
-	AccountId32, BuildStorage, Perbill,
 };
 
-type Block = frame_system::mocking::MockBlock<Test>;
+pub type Address = MultiAddress<AccountId32, u32>;
+pub type Block = sp_runtime::generic::Block<Header<u64, BlakeTwo256>, UncheckedExtrinsic>;
+pub type Signature = MultiSignature;
+pub type SignedExtra = (
+	frame_system::CheckNonce<Test>,
+	ChargeTransactionPayment<Test>,
+	crate::evm::tx_extension::SetOrigin<Test>,
+);
+pub type UncheckedExtrinsic =
+	crate::evm::runtime::UncheckedExtrinsic<Address, Signature, EthExtraImpl>;
+
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct EthExtraImpl;
+
+impl EthExtra for EthExtraImpl {
+	type Config = Test;
+	type Extension = SignedExtra;
+
+	fn get_eth_extension(nonce: u32, tip: BalanceOf<Test>) -> Self::Extension {
+		(
+			frame_system::CheckNonce::from(nonce),
+			ChargeTransactionPayment::from(tip),
+			crate::evm::tx_extension::SetOrigin::<Test>::new_from_eth_transaction(),
+		)
+	}
+}
 
 frame_support::construct_runtime!(
 	pub enum Test
@@ -80,8 +115,8 @@ pub mod test_utils {
 		Test,
 	};
 	use crate::{
-		address::AddressMapper, exec::AccountIdOf, AccountInfo, AccountInfoOf, BalanceOf, CodeInfo,
-		CodeInfoOf, Config, ContractInfo, PristineCode,
+		AccountInfo, AccountInfoOf, BalanceOf, CodeInfo, CodeInfoOf, Config, ContractInfo,
+		PristineCode, address::AddressMapper, exec::AccountIdOf,
 	};
 	use codec::{Encode, MaxEncodedLen};
 	use frame_support::traits::fungible::{InspectHold, Mutate};
@@ -180,9 +215,9 @@ pub mod test_utils {
 pub(crate) mod builder {
 	use super::Test;
 	use crate::{
-		test_utils::{builder::*, ALICE},
-		tests::RuntimeOrigin,
 		Code,
+		test_utils::{ALICE, builder::*},
+		tests::RuntimeOrigin,
 	};
 	use sp_core::{H160, H256};
 
@@ -210,15 +245,18 @@ pub(crate) mod builder {
 	}
 
 	pub fn eth_call(dest: H160) -> EthCallBuilder<Test> {
-		EthCallBuilder::<Test>::eth_call(RuntimeOrigin::signed(ALICE), dest)
+		EthCallBuilder::<Test>::eth_call(crate::Origin::<Test>::EthTransaction(ALICE).into(), dest)
+	}
+
+	pub fn eth_instantiate_with_code(code: Vec<u8>) -> EthInstantiateWithCodeBuilder<Test> {
+		EthInstantiateWithCodeBuilder::<Test>::eth_instantiate_with_code(
+			crate::Origin::<Test>::EthTransaction(ALICE).into(),
+			code,
+		)
 	}
 }
 
 impl Test {
-	pub fn set_unstable_interface(unstable_interface: bool) {
-		UNSTABLE_INTERFACE.with(|v| *v.borrow_mut() = unstable_interface);
-	}
-
 	pub fn set_allow_evm_bytecode(allow_evm_bytecode: bool) {
 		ALLOW_EVM_BYTECODE.with(|v| *v.borrow_mut() = allow_evm_bytecode);
 	}
@@ -227,7 +265,7 @@ impl Test {
 parameter_types! {
 	pub BlockWeights: frame_system::limits::BlockWeights =
 		frame_system::limits::BlockWeights::simple_max(
-			Weight::from_parts(2 * WEIGHT_REF_TIME_PER_SECOND, u64::MAX),
+			Weight::from_parts(2 * WEIGHT_REF_TIME_PER_SECOND, 10 * 1024 * 1024),
 		);
 	pub static ExistentialDeposit: u64 = 1;
 }
@@ -281,7 +319,7 @@ parameter_types! {
 #[derive_impl(pallet_transaction_payment::config_preludes::TestDefaultConfig)]
 impl pallet_transaction_payment::Config for Test {
 	type OnChargeTransaction = pallet_transaction_payment::FungibleAdapter<Balances, ()>;
-	type WeightToFee = IdentityFee<<Self as pallet_balances::Config>::Balance>;
+	type WeightToFee = BlockRatioFee<2, 1, Self, u64>;
 	type LengthToFee = FixedFee<100, <Self as pallet_balances::Config>::Balance>;
 	type FeeMultiplierUpdate = ConstFeeMultiplier<FeeMultiplier>;
 }
@@ -314,7 +352,7 @@ where
 {
 	type Success = T::AccountId;
 
-	fn try_origin(o: T::RuntimeOrigin) -> Result<Self::Success, T::RuntimeOrigin> {
+	fn try_origin(o: OriginFor<T>) -> Result<Self::Success, OriginFor<T>> {
 		let who = <frame_system::EnsureSigned<_> as EnsureOrigin<_>>::try_origin(o.clone())?;
 		if matches!(A::get(), Some(a) if who != a) {
 			return Err(o);
@@ -324,14 +362,14 @@ where
 	}
 
 	#[cfg(feature = "runtime-benchmarks")]
-	fn try_successful_origin() -> Result<T::RuntimeOrigin, ()> {
+	fn try_successful_origin() -> Result<OriginFor<T>, ()> {
 		Err(())
 	}
 }
 parameter_types! {
-	pub static UnstableInterface: bool = true;
 	pub static AllowEvmBytecode: bool = true;
 	pub CheckingAccount: AccountId32 = BOB.clone();
+	pub static DebugFlag: bool = false;
 }
 
 impl FindAuthor<<Test as frame_system::Config>::AccountId> for Test {
@@ -347,10 +385,11 @@ impl FindAuthor<<Test as frame_system::Config>::AccountId> for Test {
 impl Config for Test {
 	type Time = Timestamp;
 	type AddressMapper = AccountId32Mapper<Self>;
+	type Balance = u64;
 	type Currency = Balances;
 	type DepositPerByte = DepositPerByte;
 	type DepositPerItem = DepositPerItem;
-	type UnsafeUnstableInterface = UnstableInterface;
+	type DepositPerChildTrieItem = DepositPerItem;
 	type AllowEVMBytecode = AllowEvmBytecode;
 	type UploadOrigin = EnsureAccount<Self, UploadAccount>;
 	type InstantiateOrigin = EnsureAccount<Self, InstantiateAccount>;
@@ -358,9 +397,11 @@ impl Config for Test {
 	type ChainId = ChainId;
 	type FindAuthor = Test;
 	type Precompiles = (precompiles::WithInfo<Self>, precompiles::NoInfo<Self>);
+	type FeeInfo = FeeInfo<Address, Signature, EthExtraImpl>;
+	type DebugEnabled = DebugFlag;
 }
 
-impl TryFrom<RuntimeCall> for crate::Call<Test> {
+impl TryFrom<RuntimeCall> for Call<Test> {
 	type Error = ();
 
 	fn try_from(value: RuntimeCall) -> Result<Self, Self::Error> {
@@ -371,11 +412,29 @@ impl TryFrom<RuntimeCall> for crate::Call<Test> {
 	}
 }
 
+impl SetWeightLimit for RuntimeCall {
+	fn set_weight_limit(&mut self, new_weight_limit: Weight) -> Weight {
+		match self {
+			Self::Contracts(
+				Call::eth_call { weight_limit, .. } |
+				Call::eth_instantiate_with_code { weight_limit, .. },
+			) => {
+				let old = *weight_limit;
+				*weight_limit = new_weight_limit;
+				old
+			},
+			_ => Default::default(),
+		}
+	}
+}
+
 pub struct ExtBuilder {
 	existential_deposit: u64,
 	storage_version: Option<StorageVersion>,
 	code_hashes: Vec<sp_core::H256>,
 	genesis_config: Option<crate::GenesisConfig<Test>>,
+	genesis_state_overrides: Option<Storage>,
+	next_fee_multiplier: Option<FixedU128>,
 }
 
 impl Default for ExtBuilder {
@@ -385,6 +444,8 @@ impl Default for ExtBuilder {
 			storage_version: None,
 			code_hashes: vec![],
 			genesis_config: Some(crate::GenesisConfig::<Test>::default()),
+			genesis_state_overrides: None,
+			next_fee_multiplier: None,
 		}
 	}
 }
@@ -403,13 +464,26 @@ impl ExtBuilder {
 		self.code_hashes = code_hashes;
 		self
 	}
+	pub fn with_next_fee_multiplier(mut self, next_fee_multiplier: FixedU128) -> Self {
+		self.next_fee_multiplier = Some(next_fee_multiplier);
+		self
+	}
 	pub fn set_associated_consts(&self) {
 		EXISTENTIAL_DEPOSIT.with(|v| *v.borrow_mut() = self.existential_deposit);
+	}
+	pub fn with_genesis_state_overrides(mut self, storage: Storage) -> Self {
+		self.genesis_state_overrides = Some(storage);
+		self
 	}
 	pub fn build(self) -> sp_io::TestExternalities {
 		sp_tracing::try_init_simple();
 		self.set_associated_consts();
-		let mut t = frame_system::GenesisConfig::<Test>::default().build_storage().unwrap();
+		let mut t = self.genesis_state_overrides.unwrap_or_default();
+
+		frame_system::GenesisConfig::<Test>::default()
+			.assimilate_storage(&mut t)
+			.unwrap();
+
 		let checking_account = Pallet::<Test>::checking_account();
 
 		pallet_balances::GenesisConfig::<Test> {
@@ -418,6 +492,12 @@ impl ExtBuilder {
 		}
 		.assimilate_storage(&mut t)
 		.unwrap();
+
+		if let Some(multiplier) = self.next_fee_multiplier {
+			pallet_transaction_payment::GenesisConfig::<Test> { multiplier, ..Default::default() }
+				.assimilate_storage(&mut t)
+				.unwrap();
+		}
 
 		if let Some(genesis_config) = self.genesis_config {
 			genesis_config.assimilate_storage(&mut t).unwrap();
@@ -456,24 +536,71 @@ impl Default for Origin<Test> {
 	}
 }
 
+/// Dummy EVM bytecode for mocked addresses.
+/// This is minimal EVM bytecode (STOP) that terminates successfully.
+pub const MOCK_CODE: [u8; 1] = [0x00];
+
+/// A mock handler implementation for testing purposes.
+#[derive(DefaultNoBound)]
+pub struct MockHandlerImpl<T: crate::pallet::Config> {
+	// Always return this caller if set.
+	mock_caller: Option<H160>,
+	// Map of callee address to mocked call return value.
+	mock_call: HashMap<H160, ExecReturnValue>,
+	// Map of input data to mocked delegated caller info.
+	mock_delegate_caller: HashMap<Vec<u8>, DelegateInfo<T>>,
+}
+
+impl<T: crate::pallet::Config> MockHandler<T> for MockHandlerImpl<T> {
+	fn mock_caller(&self, _frames_len: usize) -> Option<OriginFor<T>> {
+		self.mock_caller.as_ref().map(|mock_caller| {
+			OriginFor::<T>::signed(T::AddressMapper::to_fallback_account_id(mock_caller))
+		})
+	}
+
+	fn mock_call(
+		&self,
+		_callee: H160,
+		_call_data: &[u8],
+		_value_transferred: U256,
+	) -> Option<ExecReturnValue> {
+		self.mock_call.get(&_callee).cloned()
+	}
+
+	fn mock_delegated_caller(&self, _dest: H160, input_data: &[u8]) -> Option<DelegateInfo<T>> {
+		self.mock_delegate_caller.get(&input_data.to_vec()).cloned()
+	}
+
+	fn mocked_code(&self, address: H160) -> Option<&[u8]> {
+		if self.mock_call.contains_key(&address) { Some(&MOCK_CODE) } else { None }
+	}
+}
+
 #[test]
 fn ext_builder_with_genesis_config_works() {
 	let pvm_contract = Account {
-		address: BOB_ADDR,
+		address: crate::H160::repeat_byte(0x42),
 		balance: U256::from(100_000_100),
 		nonce: 42,
 		contract_data: Some(ContractData {
-			code: compile_module("dummy").unwrap().0,
+			code: compile_module("dummy").unwrap().0.into(),
 			storage: [([1u8; 32].into(), [2u8; 32].into())].into_iter().collect(),
 		}),
 	};
 
 	let evm_contract = Account {
-		address: CHARLIE_ADDR,
+		address: crate::H160::repeat_byte(0x43),
 		balance: U256::from(1_000_00_100),
 		nonce: 43,
 		contract_data: Some(ContractData {
-			code: vec![revm::bytecode::opcode::RETURN],
+			code: vec![
+				revm::bytecode::opcode::PUSH1,
+				0x00,
+				revm::bytecode::opcode::PUSH1,
+				0x00,
+				revm::bytecode::opcode::RETURN,
+			]
+			.into(),
 			storage: [([3u8; 32].into(), [4u8; 32].into())].into_iter().collect(),
 		}),
 	};
@@ -484,6 +611,7 @@ fn ext_builder_with_genesis_config_works() {
 	let config = GenesisConfig::<Test> {
 		mapped_accounts: vec![EVE],
 		accounts: vec![eoa.clone(), pvm_contract.clone(), evm_contract.clone()],
+		..Default::default()
 	};
 
 	// Genesis serialization works
@@ -501,9 +629,14 @@ fn ext_builder_with_genesis_config_works() {
 		for contract in [pvm_contract, evm_contract] {
 			let contract_data = contract.contract_data.unwrap();
 			let contract_info = test_utils::get_contract(&contract.address);
+
+			assert!(System::account_exists(&<Test as Config>::AddressMapper::to_account_id(
+				&contract.address
+			)));
+
 			assert_eq!(
 				PristineCode::<Test>::get(&contract_info.code_hash).unwrap(),
-				contract_data.code
+				contract_data.code.0
 			);
 			assert_eq!(Pallet::<Test>::evm_nonce(&contract.address), contract.nonce);
 			assert_eq!(Pallet::<Test>::evm_balance(&contract.address), contract.balance);
@@ -514,6 +647,10 @@ fn ext_builder_with_genesis_config_works() {
 					Ok(Some(value.0.to_vec()))
 				);
 			}
+
+			// Check that we can call contract created at genesis
+			let result = builder::bare_call(contract.address).build_and_unwrap_result();
+			assert!(!result.did_revert());
 		}
 	});
 }

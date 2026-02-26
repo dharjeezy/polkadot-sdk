@@ -55,7 +55,7 @@ pub use frame_support::{
 };
 pub use xcm_runtime_apis::{
 	dry_run::runtime_decl_for_dry_run_api::DryRunApiV2,
-	fees::{runtime_decl_for_xcm_payment_api::XcmPaymentApiV1, Error as XcmPaymentApiError},
+	fees::{runtime_decl_for_xcm_payment_api::XcmPaymentApiV2, Error as XcmPaymentApiError},
 };
 
 pub use frame_support::traits::{fungible::Mutate, fungibles::Inspect, Currency};
@@ -124,9 +124,15 @@ macro_rules! test_parachain_is_trusted_teleporter {
 							.unwrap();
 						assert_eq!(messages_to_query.len(), 1);
 						remote_message = messages_to_query[0].clone();
+						// The native asset of every system chain.
+						// We want to get the delivery fees in this asset.
+						let asset_id_for_delivery_fees = VersionedAssetId::from(Location::new(1, []));
 						let delivery_fees =
-							<Runtime as $crate::macros::XcmPaymentApiV1<_>>::query_delivery_fees(destination_to_query.clone(),
-							remote_message.clone()).unwrap();
+							<Runtime as $crate::macros::XcmPaymentApiV2<_>>::query_delivery_fees(
+								destination_to_query.clone(),
+								remote_message.clone(),
+								asset_id_for_delivery_fees
+							).unwrap();
 						let latest_delivery_fees: $crate::macros::Assets = delivery_fees.clone().try_into().unwrap();
 						let $crate::macros::Fungible(inner_delivery_fees_amount) = latest_delivery_fees.inner()[0].fun else {
 							unreachable!("asset is non-fungible");
@@ -143,10 +149,19 @@ macro_rules! test_parachain_is_trusted_teleporter {
 					//       So this is just workaround, must be investigated
 					<$sender_para as $crate::macros::TestExt>::execute_with(|| { });
 
+					let receiver_total_issuance_before = <$receiver_para as $crate::macros::TestExt>::execute_with(|| {
+						<<$receiver_para as [<$receiver_para Pallet>]>::Balances
+							as $crate::macros::Currency<_>>::total_issuance()
+					});
 					// Send XCM message from Origin Parachain
 					<$sender_para as $crate::macros::TestExt>::execute_with(|| {
+						let total_issuance_source_of_truth = <$sender_para as $crate::macros::Chain>::native_total_issuance_source_of_truth();
+						let total_issuance_before = <<$sender_para as [<$sender_para Pallet>]>::Balances
+							as $crate::macros::Currency<_>>::total_issuance();
 						let origin = <$sender_para as $crate::macros::Chain>::RuntimeOrigin::signed(sender.clone());
 						$crate::macros::assert_ok!(<_ as $crate::macros::Dispatchable>::dispatch(call, origin));
+						let total_issuance_after = <<$sender_para as [<$sender_para Pallet>]>::Balances
+							as $crate::macros::Currency<_>>::total_issuance();
 
 						type RuntimeEvent = <$sender_para as $crate::macros::Chain>::RuntimeEvent;
 
@@ -160,10 +175,23 @@ macro_rules! test_parachain_is_trusted_teleporter {
 									$crate::macros::cumulus_pallet_xcmp_queue::Event::XcmpMessageSent { .. }
 								) => {},
 								RuntimeEvent::Balances(
-									$crate::macros::pallet_balances::Event::Burned { who: sender, amount }
-								) => {},
+									$crate::macros::pallet_balances::Event::Withdraw { who, .. }
+								) => {
+									who: *who == sender,
+								},
 							]
 						);
+						if total_issuance_source_of_truth {
+							assert_eq!(
+								total_issuance_after, total_issuance_before,
+								"Unexpected change in sender native token total issuance source of truth"
+							);
+						} else {
+							assert_eq!(
+								total_issuance_after, total_issuance_before - $amount,
+								"Native token total issuance should have decreased on sender"
+							);
+						}
 					});
 
 					// Receive XCM message in Destination Parachain
@@ -174,13 +202,28 @@ macro_rules! test_parachain_is_trusted_teleporter {
 							$receiver_para,
 							vec![
 								RuntimeEvent::Balances(
-									$crate::macros::pallet_balances::Event::Minted { who: receiver, .. }
-								) => {},
+									$crate::macros::pallet_balances::Event::Deposit { who, .. }
+								) => {
+									who: *who == receiver,
+								},
 								RuntimeEvent::MessageQueue(
 									$crate::macros::pallet_message_queue::Event::Processed { success: true, .. }
 								) => {},
 							]
 						);
+						let receiver_total_issuance_after = <<$receiver_para as [<$receiver_para Pallet>]>::Balances
+							as $crate::macros::Currency<_>>::total_issuance();
+						if <$receiver_para as $crate::macros::Chain>::native_total_issuance_source_of_truth() {
+							assert_eq!(
+								receiver_total_issuance_after, receiver_total_issuance_before,
+								"Unexpected change in receiver native token total issuance source of truth"
+							);
+						} else {
+							assert!(
+								receiver_total_issuance_after > receiver_total_issuance_before,
+								"Native token total issuance should have increased on receiver"
+							);
+						}
 					});
 
 					// Check if balances are updated accordingly in Origin and Destination Parachains
@@ -261,9 +304,15 @@ macro_rules! test_relay_is_trusted_teleporter {
 							.unwrap();
 						assert_eq!(messages_to_query.len(), 1);
 						remote_message = messages_to_query[0].clone();
+						// The native asset of every system chain.
+						// We want to get the delivery fees in this asset.
+						let asset_id_for_delivery_fees = VersionedAssetId::from(Location::new(0, []));
 						let delivery_fees =
-							<Runtime as $crate::macros::XcmPaymentApiV1<_>>::query_delivery_fees(destination_to_query.clone(),
-								remote_message.clone()).unwrap();
+							<Runtime as $crate::macros::XcmPaymentApiV2<_>>::query_delivery_fees(
+								destination_to_query.clone(),
+								remote_message.clone(),
+								asset_id_for_delivery_fees
+							).unwrap();
 						let latest_delivery_fees: $crate::macros::Assets = delivery_fees.clone().try_into().unwrap();
 						let $crate::macros::Fungible(inner_delivery_fees_amount) = latest_delivery_fees.inner()[0].fun else {
 							unreachable!("asset is non-fungible");
@@ -291,8 +340,10 @@ macro_rules! test_relay_is_trusted_teleporter {
 									$crate::macros::pallet_xcm::Event::Attempted { outcome: $crate::macros::Outcome::Complete { .. } }
 								) => {},
 								RuntimeEvent::Balances(
-									$crate::macros::pallet_balances::Event::Burned { who: sender, amount }
-								) => {},
+									$crate::macros::pallet_balances::Event::Withdraw { who, .. }
+								) => {
+									who: *who == sender,
+								},
 								RuntimeEvent::XcmPallet(
 									$crate::macros::pallet_xcm::Event::Sent { .. }
 								) => {},
@@ -308,8 +359,10 @@ macro_rules! test_relay_is_trusted_teleporter {
 							$receiver_para,
 							vec![
 								RuntimeEvent::Balances(
-									$crate::macros::pallet_balances::Event::Minted { who: receiver, .. }
-								) => {},
+									$crate::macros::pallet_balances::Event::Deposit { who, .. }
+								) => {
+									who: *who == receiver,
+								},
 								RuntimeEvent::MessageQueue(
 									$crate::macros::pallet_message_queue::Event::Processed { success: true, .. }
 								) => {},
@@ -406,9 +459,15 @@ macro_rules! test_parachain_is_trusted_teleporter_for_relay {
 					.unwrap();
 				assert_eq!(messages_to_query.len(), 1);
 				remote_message = messages_to_query[0].clone();
+				// The native asset of every system chain.
+				// We want to get the delivery fees in this asset.
+				let asset_id_for_delivery_fees = VersionedAssetId::from(Location::parent());
 				let delivery_fees =
-					<Runtime as $crate::macros::XcmPaymentApiV1<_>>::query_delivery_fees(destination_to_query.clone(),
-					remote_message.clone()).unwrap();
+					<Runtime as $crate::macros::XcmPaymentApiV2<_>>::query_delivery_fees(
+						destination_to_query.clone(),
+						remote_message.clone(),
+						asset_id_for_delivery_fees
+					).unwrap();
 				let latest_delivery_fees: $crate::macros::Assets = delivery_fees.clone().try_into().unwrap();
 				delivery_fees_amount = if let Some(first_asset) = latest_delivery_fees.inner().first() {
 					let $crate::macros::Fungible(inner_delivery_fees_amount) = first_asset.fun else {
@@ -450,8 +509,10 @@ macro_rules! test_parachain_is_trusted_teleporter_for_relay {
 							$crate::macros::pallet_xcm::Event::Attempted { outcome: $crate::macros::Outcome::Complete { .. } }
 						) => {},
 						RuntimeEvent::Balances(
-							$crate::macros::pallet_balances::Event::Burned { who: sender, amount }
-						) => {},
+							$crate::macros::pallet_balances::Event::Withdraw { who, .. }
+						) => {
+							who: *who == sender,
+						},
 						RuntimeEvent::PolkadotXcm(
 							$crate::macros::pallet_xcm::Event::Sent { .. }
 						) => {},
@@ -467,8 +528,10 @@ macro_rules! test_parachain_is_trusted_teleporter_for_relay {
 					$receiver_relay,
 					vec![
 						RuntimeEvent::Balances(
-							$crate::macros::pallet_balances::Event::Minted { who: receiver, .. }
-						) => {},
+							$crate::macros::pallet_balances::Event::Deposit { who, .. }
+						) => {
+							who: *who == receiver,
+						},
 						RuntimeEvent::MessageQueue(
 							$crate::macros::pallet_message_queue::Event::Processed { success: true, .. }
 						) => {},
@@ -493,31 +556,46 @@ macro_rules! test_parachain_is_trusted_teleporter_for_relay {
 
 #[macro_export]
 macro_rules! test_chain_can_claim_assets {
-	( $sender_para:ty, $runtime_call:ty, $network_id:expr, $assets:expr, $amount:expr ) => {
+	( $sender_para:ty, $xcm_config:ty, $network_id:expr, $asset:expr, $amount:expr ) => {
 		$crate::macros::paste::paste! {
+			use xcm_executor::traits::TransactAsset;
 			let sender = [<$sender_para Sender>]::get();
 			let origin = <$sender_para as $crate::macros::Chain>::RuntimeOrigin::signed(sender.clone());
 			// Receiver is the same as sender
 			let beneficiary: $crate::macros::Location =
 				$crate::macros::Junction::AccountId32 { network: Some($network_id), id: sender.clone().into() }.into();
-			let versioned_assets: $crate::macros::VersionedAssets = $assets.clone().into();
+			let assets: $crate::macros::Assets = $asset.clone().into();
+			let versioned_assets: $crate::macros::VersionedAssets = assets.clone().into();
+			let context = $crate::macros::XcmContext { origin: None, message_id: Default::default(), topic: None };
 
 			<$sender_para as $crate::macros::TestExt>::execute_with(|| {
+				// Mint some assets to trap.
+				let holdings =
+					<$xcm_config as xcm_executor::Config>::AssetTransactor::mint_asset(
+						&$asset, &context,
+					).unwrap();
+				let total_issuance_before = <<$sender_para as [<$sender_para Pallet>]>::Balances
+					as $crate::macros::Currency<_>>::total_issuance();
 				// Assets are trapped for whatever reason.
 				// The possible reasons for this might differ from runtime to runtime, so here we just drop them directly.
 				<<$sender_para as [<$sender_para Pallet>]>::PolkadotXcm as $crate::macros::DropAssets>::drop_assets(
-					&beneficiary,
-					$assets.clone().into(),
-					&$crate::macros::XcmContext { origin: None, message_id: [0u8; 32], topic: None },
+					&beneficiary, holdings, &context,
 				);
+				// assert trapping assets does not alter total issuance
+				let total_issuance_after = <<$sender_para as [<$sender_para Pallet>]>::Balances
+					as $crate::macros::Currency<_>>::total_issuance();
+				assert_eq!(total_issuance_before, total_issuance_after);
 
 				type RuntimeEvent = <$sender_para as $crate::macros::Chain>::RuntimeEvent;
 				$crate::macros::assert_expected_events!(
 					$sender_para,
 					vec![
 						RuntimeEvent::PolkadotXcm(
-							$crate::macros::pallet_xcm::Event::AssetsTrapped { origin: beneficiary, assets: versioned_assets, .. }
-						) => {},
+							$crate::macros::pallet_xcm::Event::AssetsTrapped { origin, assets, .. }
+						) => {
+							origin: *origin == beneficiary,
+							assets: *assets == versioned_assets,
+						},
 					]
 				);
 
@@ -549,8 +627,11 @@ macro_rules! test_chain_can_claim_assets {
 					$sender_para,
 					vec![
 						RuntimeEvent::PolkadotXcm(
-							$crate::macros::pallet_xcm::Event::AssetsClaimed { origin: beneficiary, assets: versioned_assets, .. }
-						) => {},
+							$crate::macros::pallet_xcm::Event::AssetsClaimed { origin, assets, .. }
+						) => {
+							origin: *origin == beneficiary,
+							assets: *assets == versioned_assets,
+						},
 					]
 				);
 
@@ -558,6 +639,11 @@ macro_rules! test_chain_can_claim_assets {
 				let balance_after = <<$sender_para as [<$sender_para Pallet>]>::Balances
 					as $crate::macros::Currency<_>>::free_balance(&sender);
 				assert_eq!(balance_after, balance_before + $amount);
+
+				// assert claiming trapped assets does not alter total issuance
+				let total_issuance_after = <<$sender_para as [<$sender_para Pallet>]>::Balances
+					as $crate::macros::Currency<_>>::total_issuance();
+				assert_eq!(total_issuance_before, total_issuance_after);
 
 				// Claiming the assets again doesn't work.
 				assert!(<$sender_para as [<$sender_para Pallet>]>::PolkadotXcm::claim_assets(
@@ -570,11 +656,15 @@ macro_rules! test_chain_can_claim_assets {
 					as $crate::macros::Currency<_>>::free_balance(&sender);
 				assert_eq!(balance, balance_after);
 
+				let holdings =
+					<$xcm_config as xcm_executor::Config>::AssetTransactor::mint_asset(
+						&$asset, &context,
+					).unwrap();
+				let total_issuance_before = <<$sender_para as [<$sender_para Pallet>]>::Balances
+					as $crate::macros::Currency<_>>::total_issuance();
 				// You can also claim assets and send them to a different account.
 				<<$sender_para as [<$sender_para Pallet>]>::PolkadotXcm as $crate::macros::DropAssets>::drop_assets(
-					&beneficiary,
-					$assets.clone().into(),
-					&$crate::macros::XcmContext { origin: None, message_id: [0u8; 32], topic: None },
+					&beneficiary, holdings, &context,
 				);
 				let receiver = [<$sender_para Receiver>]::get();
 				let other_beneficiary: $crate::macros::Location =
@@ -589,6 +679,10 @@ macro_rules! test_chain_can_claim_assets {
 				let balance_after = <<$sender_para as [<$sender_para Pallet>]>::Balances
 					as $crate::macros::Currency<_>>::free_balance(&receiver);
 				assert_eq!(balance_after, balance_before + $amount);
+				// assert claiming trapped assets does not alter total issuance
+				let total_issuance_after = <<$sender_para as [<$sender_para Pallet>]>::Balances
+					as $crate::macros::Currency<_>>::total_issuance();
+				assert_eq!(total_issuance_before, total_issuance_after);
 			});
 		}
 	};
@@ -689,8 +783,8 @@ macro_rules! test_can_estimate_and_pay_exact_fees {
 				let result = <Runtime as $crate::macros::DryRunApiV2<_,_,_,_>>::dry_run_call(origin, call.clone(),
 					$crate::macros::XCM_VERSION).unwrap();
 				let local_xcm = result.local_xcm.unwrap().clone();
-				let local_xcm_weight = <Runtime as $crate::macros::XcmPaymentApiV1<_>>::query_xcm_weight(local_xcm).unwrap();
-				local_execution_fees = <Runtime as $crate::macros::XcmPaymentApiV1<_>>::query_weight_to_asset_fee(
+				let local_xcm_weight = <Runtime as $crate::macros::XcmPaymentApiV2<_>>::query_xcm_weight(local_xcm).unwrap();
+				local_execution_fees = <Runtime as $crate::macros::XcmPaymentApiV2<_>>::query_weight_to_asset_fee(
 					local_xcm_weight,
 					$crate::macros::VersionedAssetId::from($crate::macros::AssetId($crate::macros::Location::parent())),
 				)
@@ -706,9 +800,13 @@ macro_rules! test_can_estimate_and_pay_exact_fees {
 					.unwrap();
 				assert_eq!(messages_to_query.len(), 1);
 				remote_message = messages_to_query[0].clone();
+				let asset_id_for_delivery_fees = VersionedAssetId::from(Location::parent());
 				let delivery_fees =
-					<Runtime as $crate::macros::XcmPaymentApiV1<_>>::query_delivery_fees(destination_to_query.clone(),
-						remote_message.clone()).unwrap();
+					<Runtime as $crate::macros::XcmPaymentApiV2<_>>::query_delivery_fees(
+						destination_to_query.clone(),
+						remote_message.clone(),
+						asset_id_for_delivery_fees
+					).unwrap();
 				local_delivery_fees = $crate::xcm_helpers::get_amount_from_versioned_assets(delivery_fees);
 			});
 
@@ -721,8 +819,8 @@ macro_rules! test_can_estimate_and_pay_exact_fees {
 				type RuntimeCall = <$asset_hub as $crate::macros::Chain>::RuntimeCall;
 
 				// First we get the execution fees.
-				let weight = <Runtime as $crate::macros::XcmPaymentApiV1<_>>::query_xcm_weight(remote_message.clone()).unwrap();
-				intermediate_execution_fees = <Runtime as $crate::macros::XcmPaymentApiV1<_>>::query_weight_to_asset_fee(
+				let weight = <Runtime as $crate::macros::XcmPaymentApiV2<_>>::query_xcm_weight(remote_message.clone()).unwrap();
+				intermediate_execution_fees = <Runtime as $crate::macros::XcmPaymentApiV2<_>>::query_weight_to_asset_fee(
 					weight,
 					$crate::macros::VersionedAssetId::from($crate::macros::AssetId($crate::macros::Location::new(1, []))),
 				)
@@ -750,9 +848,11 @@ macro_rules! test_can_estimate_and_pay_exact_fees {
 				// We could've gotten the message from the queue without having to dry-run, but
 				// offchain applications would have to dry-run, so we do it here as well.
 				intermediate_remote_message = messages_to_query[0].clone();
-				let delivery_fees = <Runtime as $crate::macros::XcmPaymentApiV1<_>>::query_delivery_fees(
+				let asset_id_for_delivery_fees = VersionedAssetId::from(Location::parent());
+				let delivery_fees = <Runtime as $crate::macros::XcmPaymentApiV2<_>>::query_delivery_fees(
 					destination_to_query.clone(),
 					intermediate_remote_message.clone(),
+					asset_id_for_delivery_fees,
 				)
 				.unwrap();
 				intermediate_delivery_fees = $crate::xcm_helpers::get_amount_from_versioned_assets(delivery_fees);
@@ -763,10 +863,10 @@ macro_rules! test_can_estimate_and_pay_exact_fees {
 			<$receiver_para as $crate::macros::TestExt>::execute_with(|| {
 				type Runtime = <$sender_para as $crate::macros::Chain>::Runtime;
 
-				let weight = <Runtime as $crate::macros::XcmPaymentApiV1<_>>::query_xcm_weight(
+				let weight = <Runtime as $crate::macros::XcmPaymentApiV2<_>>::query_xcm_weight(
 					intermediate_remote_message.clone()).unwrap();
 				final_execution_fees =
-					<Runtime as $crate::macros::XcmPaymentApiV1<_>>::query_weight_to_asset_fee(weight,
+					<Runtime as $crate::macros::XcmPaymentApiV2<_>>::query_weight_to_asset_fee(weight,
 						$crate::macros::VersionedAssetId::from($crate::macros::AssetId($crate::macros::Location::parent())))
 						.unwrap();
 			});
@@ -903,7 +1003,7 @@ macro_rules! test_xcm_fee_querying_apis_work_for_asset_hub {
 				));
 
 				type Runtime = <$asset_hub as $crate::macros::Chain>::Runtime;
-				let acceptable_payment_assets = <Runtime as $crate::macros::XcmPaymentApiV1<_>>::query_acceptable_payment_assets(
+				let acceptable_payment_assets = <Runtime as $crate::macros::XcmPaymentApiV2<_>>::query_acceptable_payment_assets(
 					$crate::macros::XCM_VERSION).unwrap();
 				assert_eq!(acceptable_payment_assets, vec![
 					$crate::macros::VersionedAssetId::from($crate::macros::AssetId(wnd.clone())),
@@ -915,12 +1015,12 @@ macro_rules! test_xcm_fee_querying_apis_work_for_asset_hub {
 					.buy_execution(($crate::macros::Parent, 10u128), $crate::macros::Unlimited)
 					.deposit_asset($crate::macros::All, [0u8; 32])
 					.build();
-				let weight = <Runtime as $crate::macros::XcmPaymentApiV1<_>>::query_xcm_weight(
+				let weight = <Runtime as $crate::macros::XcmPaymentApiV2<_>>::query_xcm_weight(
 					$crate::macros::VersionedXcm::from(program)).unwrap();
-				let fee_in_wnd = <Runtime as $crate::macros::XcmPaymentApiV1<_>>::query_weight_to_asset_fee(weight,
+				let fee_in_wnd = <Runtime as $crate::macros::XcmPaymentApiV2<_>>::query_weight_to_asset_fee(weight,
 					$crate::macros::VersionedAssetId::from($crate::macros::AssetId(wnd.clone()))).unwrap();
 				// Assets not in a pool don't work.
-				assert!(<Runtime as $crate::macros::XcmPaymentApiV1<_>>::query_weight_to_asset_fee(weight,
+				assert!(<Runtime as $crate::macros::XcmPaymentApiV2<_>>::query_weight_to_asset_fee(weight,
 					$crate::macros::VersionedAssetId::from(
 						$crate::macros::AssetId($crate::macros::Location::new(0,
 							[$crate::macros::PalletInstance($crate::macros::ASSETS_PALLET_ID),
@@ -929,7 +1029,7 @@ macro_rules! test_xcm_fee_querying_apis_work_for_asset_hub {
 						)
 					)
 				).is_err());
-				let fee_in_usdt_fail = <Runtime as $crate::macros::XcmPaymentApiV1<_>>::query_weight_to_asset_fee(weight,
+				let fee_in_usdt_fail = <Runtime as $crate::macros::XcmPaymentApiV2<_>>::query_weight_to_asset_fee(weight,
 					$crate::macros::VersionedAssetId::from($crate::macros::AssetId(usdt.clone())));
 				// Weight to asset fee fails because there's not enough asset in the pool.
 				// We just created it, there's none.
@@ -953,7 +1053,7 @@ macro_rules! test_xcm_fee_querying_apis_work_for_asset_hub {
 					sender.into()
 				));
 				// Now it works.
-				let fee_in_usdt = <Runtime as $crate::macros::XcmPaymentApiV1<_>>::query_weight_to_asset_fee(weight,
+				let fee_in_usdt = <Runtime as $crate::macros::XcmPaymentApiV2<_>>::query_weight_to_asset_fee(weight,
 					$crate::macros::VersionedAssetId::from($crate::macros::AssetId(usdt))
 				);
 				$crate::macros::assert_ok!(fee_in_usdt);

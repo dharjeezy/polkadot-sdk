@@ -25,7 +25,9 @@ mod host;
 mod macros;
 
 pub mod precompiles;
-pub use precompiles::{system::SYSTEM_PRECOMPILE_ADDR, utils::solidity_selector};
+pub use precompiles::{
+	storage::STORAGE_PRECOMPILE_ADDR, system::SYSTEM_PRECOMPILE_ADDR, utils::solidity_selector,
+};
 
 pub use host::{HostFn, HostFnImpl};
 
@@ -53,7 +55,7 @@ macro_rules! define_error_codes {
         )*
     ) => {
         /// Every error that can be returned to a contract when it calls any of the host functions.
-        #[derive(Debug, PartialEq, Eq)]
+        #[derive(Debug, PartialEq, Eq, Copy, Clone)]
         #[repr(u32)]
         pub enum ReturnErrorCode {
             /// API call successful.

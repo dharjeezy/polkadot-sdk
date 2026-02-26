@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 use crate::{CallFlags, Result, ReturnFlags, StorageFlags};
-use pallet_revive_proc_macro::unstable_hostfn;
 
 #[cfg(target_arch = "riscv64")]
 mod riscv64;
@@ -119,6 +118,20 @@ pub trait HostFn: private::Sealed {
 		output: Option<&mut &mut [u8]>,
 	) -> Result;
 
+	/// Same as [HostFn::call] but receives the one-dimensional EVM gas argument.
+	///
+	/// Adds the EVM gas stipend for non-zero value calls.
+	///
+	/// If gas is `u64::MAX`, the call will run with uncapped limits.
+	fn call_evm(
+		flags: CallFlags,
+		callee: &[u8; 20],
+		gas: u64,
+		value: &[u8; 32],
+		input_data: &[u8],
+		output: Option<&mut &mut [u8]>,
+	) -> Result;
+
 	/// Stores the address of the caller into the supplied buffer.
 	///
 	/// If this is a top-level call (i.e. initiated by an extrinsic) the origin address of the
@@ -203,6 +216,17 @@ pub trait HostFn: private::Sealed {
 		ref_time_limit: u64,
 		proof_size_limit: u64,
 		deposit_limit: &[u8; 32],
+		input_data: &[u8],
+		output: Option<&mut &mut [u8]>,
+	) -> Result;
+
+	/// Same as [HostFn::delegate_call] but receives the one-dimensional EVM gas argument.
+	///
+	/// If gas is `u64::MAX`, the call will run with uncapped limits.
+	fn delegate_call_evm(
+		flags: CallFlags,
+		address: &[u8; 20],
+		gas: u64,
 		input_data: &[u8],
 		output: Option<&mut &mut [u8]>,
 	) -> Result;
@@ -397,15 +421,6 @@ pub trait HostFn: private::Sealed {
 	/// - `output`: A reference to the output data buffer to write the transferred value.
 	fn value_transferred(output: &mut [u8; 32]);
 
-	/// Stores the price for the specified amount of gas into the supplied buffer.
-	///
-	/// # Parameters
-	///
-	/// - `ref_time_limit`: The *ref_time* Weight limit to query the price for.
-	/// - `proof_size_limit`: The *proof_size* Weight limit to query the price for.
-	/// - `output`: A reference to the output data buffer to write the price.
-	fn weight_to_fee(ref_time_limit: u64, proof_size_limit: u64, output: &mut [u8; 32]);
-
 	/// Returns the size of the returned data of the last contract call or instantiation.
 	fn return_data_size() -> u64;
 
@@ -416,8 +431,8 @@ pub trait HostFn: private::Sealed {
 	/// - `offset`: Byte offset into the returned data
 	fn return_data_copy(output: &mut &mut [u8], offset: u32);
 
-	/// Returns the amount of ref_time left.
-	fn ref_time_left() -> u64;
+	/// Returns the amount of ethereum gas left.
+	fn gas_left() -> u64;
 
 	/// Stores the current block author of into the supplied buffer.
 	///
@@ -441,100 +456,9 @@ pub trait HostFn: private::Sealed {
 	/// - `output`: A reference to the output data buffer to write the block number.
 	fn block_hash(block_number: &[u8; 32], output: &mut [u8; 32]);
 
-	/// Clear the value at the given key in the contract storage.
-	///
-	/// # Parameters
-	///
-	/// - `key`: The storage key.
-	///
-	/// # Return
-	///
-	/// Returns the size of the pre-existing value at the specified key if any.
-	#[unstable_hostfn]
-	fn clear_storage(flags: StorageFlags, key: &[u8]) -> Option<u32>;
-
-	/// Checks whether there is a value stored under the given key.
-	///
-	/// The key length must not exceed the maximum defined by the `pallet-revive` parameter.
-	///
-	/// # Parameters
-	/// - `key`: The storage key.
-	///
-	/// # Return
-	///
-	/// Returns the size of the pre-existing value at the specified key if any.
-	#[unstable_hostfn]
-	fn contains_storage(flags: StorageFlags, key: &[u8]) -> Option<u32>;
-
-	/// Calculates Ethereum address from the ECDSA compressed public key and stores
-	/// it into the supplied buffer.
-	///
-	/// # Parameters
-	///
-	/// - `pubkey`: The public key bytes.
-	/// - `output`: A reference to the output data buffer to write the address.
-	///
-	/// # Errors
-	///
-	/// - [EcdsaRecoveryFailed][`crate::ReturnErrorCode::EcdsaRecoveryFailed]
-	#[unstable_hostfn]
-	fn ecdsa_to_eth_address(pubkey: &[u8; 33], output: &mut [u8; 20]) -> Result;
-
-	/// Replace the contract code at the specified address with new code.
-	///
-	/// # Note
-	///
-	/// There are a couple of important considerations which must be taken into account when
-	/// using this API:
-	///
-	/// 1. The storage at the code address will remain untouched. This means that contract
-	/// developers must ensure that the storage layout of the new code is compatible with that of
-	/// the old code.
-	///
-	/// 2. Contracts using this API can't be assumed as having deterministic addresses. Said another
-	/// way, when using this API you lose the guarantee that an address always identifies a specific
-	/// code hash.
-	///
-	/// 3. If a contract calls into itself after changing its code the new call would use
-	/// the new code. However, if the original caller panics after returning from the sub call it
-	/// would revert the changes made by [`set_code_hash()`][`Self::set_code_hash`] and the next
-	/// caller would use the old code.
-	///
-	/// # Parameters
-	///
-	/// - `code_hash`: The hash of the new code. Should be decodable as an `T::Hash`. Traps
-	///   otherwise.
-	///
-	/// # Panics
-	///
-	/// Panics if there is no code on-chain with the specified hash.
-	#[unstable_hostfn]
-	fn set_code_hash(code_hash: &[u8; 32]);
-
-	/// Verify a sr25519 signature
-	///
-	/// # Parameters
-	///
-	/// - `signature`: The signature bytes.
-	/// - `message`: The message bytes.
-	///
-	/// # Errors
-	///
-	/// - [Sr25519VerifyFailed][`crate::ReturnErrorCode::Sr25519VerifyFailed]
-	#[unstable_hostfn]
-	fn sr25519_verify(signature: &[u8; 64], message: &[u8], pub_key: &[u8; 32]) -> Result;
-
-	/// Retrieve and remove the value under the given key from storage.
-	///
-	/// # Parameters
-	/// - `key`: The storage key.
-	/// - `output`: A reference to the output data buffer to write the storage entry.
-	///
-	/// # Errors
-	///
-	/// [KeyNotFound][`crate::ReturnErrorCode::KeyNotFound]
-	#[unstable_hostfn]
-	fn take_storage(flags: StorageFlags, key: &[u8], output: &mut &mut [u8]) -> Result;
+	/// Reverts the execution and cedes all supplied gas,
+	/// akin to the `INVALID` EVM opcode.
+	fn consume_all_gas() -> !;
 
 	/// Remove the calling account and transfer remaining **free** balance.
 	///
@@ -551,7 +475,6 @@ pub trait HostFn: private::Sealed {
 	/// - The contract is live i.e is already on the call stack.
 	/// - Failed to send the balance to the beneficiary.
 	/// - The deletion queue is full.
-	#[unstable_hostfn]
 	fn terminate(beneficiary: &[u8; 20]) -> !;
 }
 

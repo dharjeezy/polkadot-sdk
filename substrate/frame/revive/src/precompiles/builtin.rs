@@ -20,9 +20,11 @@ mod bn128;
 mod ecrecover;
 mod identity;
 mod modexp;
+mod p256_verify;
 mod point_eval;
 mod ripemd160;
 mod sha256;
+mod storage;
 mod system;
 
 #[cfg(feature = "runtime-benchmarks")]
@@ -30,13 +32,14 @@ mod benchmarking;
 
 #[cfg(feature = "runtime-benchmarks")]
 use crate::{
-	precompiles::{ExtWithInfo, Instance, Precompiles},
 	Config,
+	precompiles::{ExtWithInfo, Instance, Precompiles},
 };
 
 #[cfg(feature = "runtime-benchmarks")]
 pub use self::{
 	benchmarking::{IBenchmarking, NoInfo, WithInfo},
+	storage::Storage,
 	system::System,
 };
 
@@ -57,7 +60,9 @@ type Production<T> = (
 	bn128::Bn128Pairing<T>,
 	blake2f::Blake2F<T>,
 	point_eval::PointEval<T>,
+	p256_verify::P256Verify<T>,
 	system::System<T>,
+	storage::Storage<T>,
 );
 
 #[cfg(feature = "runtime-benchmarks")]

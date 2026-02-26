@@ -153,6 +153,8 @@ enum KadQuery {
 	PutValue(RecordKey, Instant),
 	/// `GET_PROVIDERS` query for key and when it was initiated.
 	GetProviders(RecordKey, Instant),
+	/// `ADD_PROVIDER` query for key and when it was initiated.
+	AddProvider(RecordKey, Instant),
 }
 
 /// Networking backend for `litep2p`.
@@ -215,8 +217,9 @@ impl Litep2pNetworkBackend {
 						.map_or(None, |peer| Some((peer, Some(address)))),
 					_ => None,
 				},
-				Some(Protocol::P2p(multihash)) =>
-					PeerId::from_multihash(multihash.into()).map_or(None, |peer| Some((peer, None))),
+				Some(Protocol::P2p(multihash)) => {
+					PeerId::from_multihash(multihash.into()).map_or(None, |peer| Some((peer, None)))
+				},
 				_ => None,
 			})
 			.fold(HashMap::new(), |mut acc, (peer, maybe_address)| {
@@ -234,7 +237,7 @@ impl Litep2pNetworkBackend {
 			.filter_map(|(peer, addresses)| {
 				// `peers` contained multiaddress in the form `/p2p/<peer ID>`
 				if addresses.is_empty() {
-					return Some(peer)
+					return Some(peer);
 				}
 
 				if self.litep2p.add_known_address(peer.into(), addresses.clone().into_iter()) == 0 {
@@ -242,7 +245,7 @@ impl Litep2pNetworkBackend {
 						target: LOG_TARGET,
 						"couldn't add any addresses for {peer:?} and it won't be added as reserved peer",
 					);
-					return None
+					return None;
 				}
 
 				self.peerstore_handle.add_known_peer(peer);
@@ -292,14 +295,15 @@ impl Litep2pNetworkBackend {
 							"unknown protocol {protocol:?}, ignoring {address:?}",
 						);
 
-						return None
+						return None;
 					},
 				}
 
 				match iter.next() {
 					Some(Protocol::Tcp(_)) => match iter.next() {
-						Some(Protocol::Ws(_) | Protocol::Wss(_)) =>
-							Some((None, Some(address.clone()))),
+						Some(Protocol::Ws(_) | Protocol::Wss(_)) => {
+							Some((None, Some(address.clone())))
+						},
 						Some(Protocol::P2p(_)) | None => Some((Some(address.clone()), None)),
 						protocol => {
 							log::error!(
@@ -482,8 +486,9 @@ impl<B: BlockT + 'static, H: ExHashT> NetworkBackend<B, H> for Litep2pNetworkBac
 				use sc_network_types::multiaddr::Protocol;
 
 				let address = match address.iter().last() {
-					Some(Protocol::Ws(_) | Protocol::Wss(_) | Protocol::Tcp(_)) =>
-						address.with(Protocol::P2p(peer.into())),
+					Some(Protocol::Ws(_) | Protocol::Wss(_) | Protocol::Tcp(_)) => {
+						address.with(Protocol::P2p(peer.into()))
+					},
 					Some(Protocol::P2p(_)) => address,
 					_ => return acc,
 				};
@@ -684,7 +689,8 @@ impl<B: BlockT + 'static, H: ExHashT> NetworkBackend<B, H> for Litep2pNetworkBac
 							self.discovery.store_record(key, value, publisher.map(Into::into), expires).await;
 						}
 						NetworkServiceCommand::StartProviding { key } => {
-							self.discovery.start_providing(key).await;
+							let query_id = self.discovery.start_providing(key.clone()).await;
+							self.pending_queries.insert(query_id, KadQuery::AddProvider(key, Instant::now()));
 						}
 						NetworkServiceCommand::StopProviding { key } => {
 							self.discovery.stop_providing(key).await;
@@ -967,6 +973,42 @@ impl<B: BlockT + 'static, H: ExHashT> NetworkBackend<B, H> for Litep2pNetworkBac
 							}
 						}
 					}
+					Some(DiscoveryEvent::AddProviderSuccess { query_id, provided_key }) => {
+						match self.pending_queries.remove(&query_id) {
+							Some(KadQuery::AddProvider(key, started)) => {
+								debug_assert_eq!(key, provided_key.into());
+
+								log::trace!(
+									target: LOG_TARGET,
+									"`ADD_PROVIDER` for {key:?} ({query_id:?}) succeeded",
+								);
+
+								self.event_streams.send(Event::Dht(
+									DhtEvent::StartedProviding(key.into())
+								));
+
+								if let Some(ref metrics) = self.metrics {
+									metrics
+										.kademlia_query_duration
+										.with_label_values(&["provider-add"])
+										.observe(started.elapsed().as_secs_f64());
+								}
+							}
+							Some(_) => {
+								log::error!(
+									target: LOG_TARGET,
+									"Invalid pending query for `ADD_PROVIDER`: {query_id:?}"
+								);
+								debug_assert!(false);
+							}
+							None => {
+								log::trace!(
+									target: LOG_TARGET,
+									"`ADD_PROVIDER` for key {provided_key:?} ({query_id:?}) succeeded (republishing)",
+								);
+							}
+						}
+					}
 					Some(DiscoveryEvent::QueryFailed { query_id }) => {
 						match self.pending_queries.remove(&query_id) {
 							Some(KadQuery::FindNode(peer_id, started)) => {
@@ -1037,10 +1079,27 @@ impl<B: BlockT + 'static, H: ExHashT> NetworkBackend<B, H> for Litep2pNetworkBac
 										.observe(started.elapsed().as_secs_f64());
 								}
 							},
-							None => {
-								log::warn!(
+							Some(KadQuery::AddProvider(key, started)) => {
+								log::debug!(
 									target: LOG_TARGET,
-									"non-existent query failed ({query_id:?})",
+									"`ADD_PROVIDER` ({query_id:?}) failed with key {key:?}",
+								);
+
+								self.event_streams.send(Event::Dht(
+									DhtEvent::StartProvidingFailed(key)
+								));
+
+								if let Some(ref metrics) = self.metrics {
+									metrics
+										.kademlia_query_duration
+										.with_label_values(&["provider-add-failed"])
+										.observe(started.elapsed().as_secs_f64());
+								}
+							},
+							None => {
+								log::debug!(
+									target: LOG_TARGET,
+									"non-existent query (likely republishing a provider) failed ({query_id:?})",
 								);
 							}
 						}

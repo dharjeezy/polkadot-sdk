@@ -17,6 +17,7 @@ mod aliases;
 mod claim_assets;
 mod exchange_asset;
 mod fellowship_treasury;
+mod foreign_assets;
 mod hybrid_transfers;
 mod reserve_transfer;
 mod reward_pool;
@@ -49,6 +50,42 @@ macro_rules! assets_balance_on {
 			<$chain>::execute_with(|| {
 				type Assets = <$chain as [<$chain Pallet>]>::Assets;
 				<Assets as frame_support::traits::fungibles::Inspect<_>>::balance($id, $who)
+			})
+		}
+	};
+}
+
+#[macro_export]
+macro_rules! foreign_issuance_on {
+	( $chain:ident, $id:expr ) => {
+		emulated_integration_tests_common::impls::paste::paste! {
+			<$chain>::execute_with(|| {
+				type ForeignAssets = <$chain as [<$chain Pallet>]>::ForeignAssets;
+				<ForeignAssets as frame_support::traits::fungibles::Inspect<_>>::total_issuance($id)
+			})
+		}
+	};
+}
+
+#[macro_export]
+macro_rules! assets_issuance_on {
+	( $chain:ident, $id:expr ) => {
+		emulated_integration_tests_common::impls::paste::paste! {
+			<$chain>::execute_with(|| {
+				type Assets = <$chain as [<$chain Pallet>]>::Assets;
+				<Assets as frame_support::traits::fungibles::Inspect<_>>::total_issuance($id)
+			})
+		}
+	};
+}
+
+#[macro_export]
+macro_rules! balances_issuance_on {
+	( $chain:ident ) => {
+		emulated_integration_tests_common::impls::paste::paste! {
+			<$chain>::execute_with(|| {
+				type Balances = <$chain as [<$chain Pallet>]>::Balances;
+				<Balances as frame_support::traits::fungible::Inspect<_>>::total_issuance()
 			})
 		}
 	};

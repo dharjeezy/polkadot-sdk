@@ -336,14 +336,20 @@ fn has_expected_system_config(path: syn::Path, frame_system: &syn::Path) -> bool
 			(true, false) =>
 			// We can't use the path to `frame_system` from `frame` if `frame_system` is not being
 			// in scope through `frame`.
-				return false,
+			{
+				return false
+			},
 			(false, true) =>
 			// We know that the only valid frame_system path is one that is `frame_system`, as
 			// `frame` re-exports it as such.
-				syn::parse2::<syn::Path>(quote::quote!(frame_system)).expect("is a valid path; qed"),
+			{
+				syn::parse2::<syn::Path>(quote::quote!(frame_system)).expect("is a valid path; qed")
+			},
 			(_, _) =>
 			// They are either both `frame_system` or both `polkadot_sdk_frame::xyz::frame_system`.
-				frame_system.clone(),
+			{
+				frame_system.clone()
+			},
 		};
 
 	expected_system_config
@@ -365,10 +371,12 @@ pub fn replace_self_by_t(input: proc_macro2::TokenStream) -> proc_macro2::TokenS
 	input
 		.into_iter()
 		.map(|token_tree| match token_tree {
-			proc_macro2::TokenTree::Group(group) =>
-				proc_macro2::Group::new(group.delimiter(), replace_self_by_t(group.stream())).into(),
-			proc_macro2::TokenTree::Ident(ident) if ident == "Self" =>
-				proc_macro2::Ident::new("T", ident.span()).into(),
+			proc_macro2::TokenTree::Group(group) => {
+				proc_macro2::Group::new(group.delimiter(), replace_self_by_t(group.stream())).into()
+			},
+			proc_macro2::TokenTree::Ident(ident) if ident == "Self" => {
+				proc_macro2::Ident::new("T", ident.span()).into()
+			},
 			other => other,
 		})
 		.collect()
@@ -470,8 +478,8 @@ impl ConfigDef {
 				}
 			}
 
-			while let Ok(Some(pallet_attr)) =
-				helper::take_first_item_pallet_attr::<PalletAttr>(trait_item)
+			while let Some(pallet_attr) =
+				helper::take_first_item_pallet_attr::<PalletAttr>(trait_item)?
 			{
 				match (pallet_attr.typ, &trait_item) {
 					(PalletAttrType::Constant(constant_attr), syn::TraitItem::Type(ref typ)) => {
@@ -570,7 +578,7 @@ impl ConfigDef {
 						span,
 						"Invalid #[pallet::include_metadata] for `type RuntimeEvent`. \
 						The associated type `RuntimeEvent` is already collected in the metadata.",
-					))
+					));
 				}
 
 				if already_constant {
@@ -578,7 +586,7 @@ impl ConfigDef {
 						span,
 						"Invalid #[pallet::include_metadata]: conflict with #[pallet::constant]. \
 						Pallet constant already collect the metadata for the type.",
-					))
+					));
 				}
 
 				if let syn::TraitItem::Type(ref ty) = trait_item {

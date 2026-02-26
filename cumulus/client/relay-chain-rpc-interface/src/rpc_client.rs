@@ -276,6 +276,17 @@ impl RelayChainRpcClient {
 		self.request("state_getReadProof", params).await
 	}
 
+	/// Get child trie read proof for `child_keys`
+	pub async fn state_get_child_read_proof(
+		&self,
+		child_storage_key: sp_core::storage::PrefixedStorageKey,
+		child_keys: Vec<StorageKey>,
+		at: Option<RelayHash>,
+	) -> Result<ReadProof<RelayHash>, RelayChainError> {
+		let params = rpc_params![child_storage_key, child_keys, at];
+		self.request("state_getChildReadProof", params).await
+	}
+
 	/// Retrieve storage item at `storage_key`
 	pub async fn state_get_storage(
 		&self,
@@ -424,8 +435,18 @@ impl RelayChainRpcClient {
 	pub async fn parachain_host_unapplied_slashes(
 		&self,
 		at: RelayHash,
-	) -> Result<Vec<(SessionIndex, CandidateHash, slashing::PendingSlashes)>, RelayChainError> {
+	) -> Result<Vec<(SessionIndex, CandidateHash, slashing::LegacyPendingSlashes)>, RelayChainError>
+	{
 		self.call_remote_runtime_function("ParachainHost_unapplied_slashes", at, None::<()>)
+			.await
+	}
+
+	/// Returns a list of validators that lost a past session dispute and need to be slashed.
+	pub async fn parachain_host_unapplied_slashes_v2(
+		&self,
+		at: RelayHash,
+	) -> Result<Vec<(SessionIndex, CandidateHash, slashing::PendingSlashes)>, RelayChainError> {
+		self.call_remote_runtime_function("ParachainHost_unapplied_slashes_v2", at, None::<()>)
 			.await
 	}
 

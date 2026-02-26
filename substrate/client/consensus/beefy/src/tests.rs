@@ -304,7 +304,7 @@ pub(crate) struct RuntimeApi {
 
 impl ProvideRuntimeApi<Block> for TestApi {
 	type Api = RuntimeApi;
-	fn runtime_api(&self) -> ApiRef<Self::Api> {
+	fn runtime_api(&self) -> ApiRef<'_, Self::Api> {
 		RuntimeApi { inner: self.clone() }.into()
 	}
 }
@@ -1585,8 +1585,9 @@ async fn gossipped_finality_proofs() {
 				.ok()
 				.and_then(|message| match message {
 					GossipMessage::<Block, ecdsa_crypto::AuthorityId>::Vote(_) => unreachable!(),
-					GossipMessage::<Block, ecdsa_crypto::AuthorityId>::FinalityProof(proof) =>
-						Some(proof),
+					GossipMessage::<Block, ecdsa_crypto::AuthorityId>::FinalityProof(proof) => {
+						Some(proof)
+					},
 				})
 			})
 			.fuse(),

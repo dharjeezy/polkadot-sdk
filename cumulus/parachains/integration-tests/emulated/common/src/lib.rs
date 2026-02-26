@@ -64,6 +64,10 @@ pub const ASSET_HUB_WESTEND_ID: u32 = 1000;
 pub const ASSETS_PALLET_ID: u8 = 50;
 
 parameter_types! {
+	pub PenpalALocation: xcm::v5::Location
+		= xcm::v5::Location::new(1, [xcm::v5::Junction::Parachain(PENPAL_A_ID)]);
+	pub PenpalBLocation: xcm::v5::Location
+		= xcm::v5::Location::new(1, [xcm::v5::Junction::Parachain(PENPAL_B_ID)]);
 	pub PenpalATeleportableAssetLocation: xcm::v5::Location
 		= xcm::v5::Location::new(1, [
 				xcm::v5::Junction::Parachain(PENPAL_A_ID),
@@ -127,8 +131,8 @@ pub mod collators {
 
 	pub fn invulnerables() -> Vec<(AccountId, AuraId)> {
 		vec![
-			(Sr25519Keyring::Alice.to_account_id(), Sr25519Keyring::Alice.public().into()),
-			(Sr25519Keyring::Bob.to_account_id(), Sr25519Keyring::Bob.public().into()),
+			(Sr25519Keyring::Dave.to_account_id(), Sr25519Keyring::Dave.public().into()),
+			(Sr25519Keyring::Eve.to_account_id(), Sr25519Keyring::Eve.public().into()),
 		]
 	}
 }

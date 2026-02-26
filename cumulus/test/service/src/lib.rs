@@ -52,7 +52,8 @@ use cumulus_client_consensus_common::ParachainBlockImport as TParachainBlockImpo
 use cumulus_client_pov_recovery::{RecoveryDelayRange, RecoveryHandle};
 use cumulus_client_service::{
 	build_network, prepare_node_config, start_relay_chain_tasks, BuildNetworkParams,
-	CollatorSybilResistance, DARecoveryProfile, StartRelayChainTasksParams,
+	CollatorSybilResistance, DARecoveryProfile, ParachainTracingExecuteBlock,
+	StartRelayChainTasksParams,
 };
 use cumulus_primitives_core::{relay_chain::ValidationCode, GetParachainInfo, ParaId};
 use cumulus_relay_chain_inprocess_interface::RelayChainInProcessInterface;
@@ -195,6 +196,7 @@ pub fn new_partial(
 			None,
 			executor,
 			enable_import_proof_record,
+			Default::default(),
 		)?;
 	let client = Arc::new(client);
 
@@ -269,7 +271,7 @@ async fn build_relay_chain_interface(
 			Some("Relaychain"),
 		)
 		.map_err(|e| RelayChainError::Application(Box::new(e) as Box<_>))?,
-		cumulus_client_cli::RelayChainMode::ExternalRpc(rpc_target_urls) =>
+		cumulus_client_cli::RelayChainMode::ExternalRpc(rpc_target_urls) => {
 			return build_minimal_relay_chain_node_with_rpc(
 				relay_chain_config,
 				parachain_prometheus_registry,
@@ -277,7 +279,8 @@ async fn build_relay_chain_interface(
 				rpc_target_urls,
 			)
 			.await
-			.map(|r| r.0),
+			.map(|r| r.0)
+		},
 	};
 
 	task_manager.add_child(relay_chain_node.task_manager);
@@ -361,6 +364,7 @@ where
 			transaction_pool: transaction_pool.clone(),
 			para_id,
 			spawn_handle: task_manager.spawn_handle(),
+			spawn_essential_handle: task_manager.spawn_essential_handle(),
 			relay_chain_interface: relay_chain_interface.clone(),
 			import_queue: params.import_queue,
 			metrics: Net::register_notification_metrics(
@@ -389,6 +393,7 @@ where
 		system_rpc_tx,
 		tx_handler_controller,
 		telemetry: None,
+		tracing_execute_block: Some(Arc::new(ParachainTracingExecuteBlock::new(client.clone()))),
 	})?;
 
 	let announce_block = {
@@ -429,8 +434,9 @@ where
 		prometheus_registry: None,
 	})?;
 
+	let collator_peer_id = network.local_peer_id();
 	if let Some(collator_key) = collator_key {
-		let proposer = sc_basic_authorship::ProposerFactory::with_proof_recording(
+		let proposer = sc_basic_authorship::ProposerFactory::new(
 			task_manager.spawn_handle(),
 			client.clone(),
 			transaction_pool.clone(),
@@ -468,9 +474,10 @@ where
 				reinitialize: false,
 				slot_offset: Duration::from_secs(1),
 				block_import_handle: slot_based_handle,
-				spawner: task_manager.spawn_handle(),
+				spawner: task_manager.spawn_essential_handle(),
 				export_pov: None,
 				max_pov_percentage: None,
+				collator_peer_id,
 			};
 
 			slot_based::run::<Block, AuthorityPair, _, _, _, _, _, _, _, _, _>(params);
@@ -487,6 +494,7 @@ where
 				},
 				keystore,
 				collator_key,
+				collator_peer_id,
 				para_id,
 				overseer_handle,
 				relay_chain_slot_duration,
@@ -708,7 +716,7 @@ impl TestNodeBuilder {
 
 		let (task_manager, client, network, rpc_handlers, transaction_pool, backend) =
 			match relay_chain_config.network.network_backend {
-				sc_network::config::NetworkBackendType::Libp2p =>
+				sc_network::config::NetworkBackendType::Libp2p => {
 					start_node_impl::<_, sc_network::NetworkWorker<_, _>>(
 						parachain_config,
 						self.collator_key,
@@ -721,8 +729,9 @@ impl TestNodeBuilder {
 						false,
 					)
 					.await
-					.expect("could not create Cumulus test service"),
-				sc_network::config::NetworkBackendType::Litep2p =>
+					.expect("could not create Cumulus test service")
+				},
+				sc_network::config::NetworkBackendType::Litep2p => {
 					start_node_impl::<_, sc_network::Litep2pNetworkBackend>(
 						parachain_config,
 						self.collator_key,
@@ -735,7 +744,8 @@ impl TestNodeBuilder {
 						false,
 					)
 					.await
-					.expect("could not create Cumulus test service"),
+					.expect("could not create Cumulus test service")
+				},
 			};
 		let peer_id = network.local_peer_id();
 		let multiaddr = polkadot_test_service::get_listen_address(network.clone()).await;
@@ -837,6 +847,7 @@ pub fn node_config(
 			rate_limit: None,
 			rate_limit_whitelisted_ips: Default::default(),
 			rate_limit_trust_proxy_headers: Default::default(),
+			request_logger_limit: 1024,
 		},
 		prometheus_config: None,
 		telemetry_endpoints: None,

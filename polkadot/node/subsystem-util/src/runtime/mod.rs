@@ -45,7 +45,8 @@ use crate::{
 	request_disabled_validators, request_from_runtime, request_key_ownership_proof,
 	request_node_features, request_on_chain_votes, request_session_executor_params,
 	request_session_index_for_child, request_session_info, request_submit_report_dispute_lost,
-	request_unapplied_slashes, request_validation_code_by_hash, request_validator_groups,
+	request_unapplied_slashes, request_unapplied_slashes_v2, request_validation_code_by_hash,
+	request_validator_groups,
 };
 
 /// Errors that can happen on runtime fetches.
@@ -298,9 +299,9 @@ impl RuntimeInfo {
 					})
 				});
 			let info = ValidatorInfo { our_index: Some(our_index), our_group };
-			return Ok(info)
+			return Ok(info);
 		}
-		return Ok(ValidatorInfo { our_index: None, our_group: None })
+		return Ok(ValidatorInfo { our_index: None, our_group: None });
 	}
 
 	/// Get our `ValidatorIndex`.
@@ -313,7 +314,7 @@ impl RuntimeInfo {
 		let keystore = self.keystore.as_ref()?;
 		for (i, v) in validators.iter().enumerate() {
 			if Keystore::has_keys(&**keystore, &[(v.to_raw_vec(), ValidatorId::ID)]) {
-				return Some(ValidatorIndex(i as u32))
+				return Some(ValidatorIndex(i as u32));
 			}
 		}
 		None
@@ -424,6 +425,8 @@ where
 }
 
 /// Fetch a list of `PendingSlashes` from the runtime.
+/// Will fallback to `unapplied_slashes` if the runtime does not
+/// support `unapplied_slashes_v2`.
 pub async fn get_unapplied_slashes<Sender>(
 	sender: &mut Sender,
 	relay_parent: Hash,
@@ -431,7 +434,29 @@ pub async fn get_unapplied_slashes<Sender>(
 where
 	Sender: SubsystemSender<RuntimeApiMessage>,
 {
-	recv_runtime(request_unapplied_slashes(relay_parent, sender).await).await
+	match recv_runtime(request_unapplied_slashes_v2(relay_parent, sender).await).await {
+		Ok(v2) => Ok(v2),
+		Err(Error::RuntimeRequest(RuntimeApiError::NotSupported { .. })) => {
+			// Fallback to legacy unapplied_slashes
+			let legacy =
+				recv_runtime(request_unapplied_slashes(relay_parent, sender).await).await?;
+			// Convert legacy slashes to PendingSlashes
+			Ok(legacy
+				.into_iter()
+				.map(|(session, candidate_hash, legacy_slash)| {
+					(
+						session,
+						candidate_hash,
+						slashing::PendingSlashes {
+							keys: legacy_slash.keys,
+							kind: legacy_slash.kind.into(),
+						},
+					)
+				})
+				.collect())
+		},
+		Err(e) => Err(e),
+	}
 }
 
 /// Generate validator key ownership proof.

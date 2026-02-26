@@ -60,7 +60,7 @@ pub use disputes::{
 /// relatively rare.
 ///
 /// The associated worker binaries should use the same version as the node that spawns them.
-pub const NODE_VERSION: &'static str = "1.19.2";
+pub const NODE_VERSION: &'static str = "1.21.1";
 
 // For a 16-ary Merkle Prefix Trie, we can expect at most 16 32-byte hashes per node
 // plus some overhead:
@@ -241,8 +241,9 @@ pub enum StatementWithPVD {
 impl std::fmt::Debug for StatementWithPVD {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
 		match self {
-			StatementWithPVD::Seconded(seconded, _) =>
-				write!(f, "Seconded: {:?}", seconded.descriptor),
+			StatementWithPVD::Seconded(seconded, _) => {
+				write!(f, "Seconded: {:?}", seconded.descriptor)
+			},
 			StatementWithPVD::Valid(hash) => write!(f, "Valid: {:?}", hash),
 		}
 	}
@@ -582,7 +583,7 @@ impl TryFrom<Vec<Vec<u8>>> for Proof {
 
 	fn try_from(input: Vec<Vec<u8>>) -> Result<Self, Self::Error> {
 		if input.len() > MERKLE_PROOF_MAX_DEPTH {
-			return Err(Self::Error::MerkleProofDepthExceeded(input.len()))
+			return Err(Self::Error::MerkleProofDepthExceeded(input.len()));
 		}
 		let mut out = Vec::new();
 		for element in input.into_iter() {
@@ -665,7 +666,7 @@ impl ErasureChunk {
 #[cfg(not(target_os = "unknown"))]
 pub fn maybe_compress_pov(pov: PoV) -> PoV {
 	let PoV { block_data: BlockData(raw) } = pov;
-	let raw = sp_maybe_compressed_blob::compress(&raw, POV_BOMB_LIMIT).unwrap_or(raw);
+	let raw = sp_maybe_compressed_blob::compress_weakly(&raw, POV_BOMB_LIMIT).unwrap_or(raw);
 
 	let pov = PoV { block_data: BlockData(raw) };
 	pov

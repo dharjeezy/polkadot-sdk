@@ -18,7 +18,6 @@ use crate::{
 	host::{CallFlags, HostFn, HostFnImpl, Result, StorageFlags},
 	pack_hi_lo, ReturnFlags,
 };
-use pallet_revive_proc_macro::unstable_hostfn;
 
 mod sys {
 	use crate::ReturnCode;
@@ -48,7 +47,6 @@ mod sys {
 			key_ptr: *const u8,
 			value_ptr: *const u8,
 		) -> ReturnCode;
-		pub fn clear_storage(flags: u32, key_ptr: *const u8, key_len: u32) -> ReturnCode;
 		pub fn get_storage(
 			flags: u32,
 			key_ptr: *const u8,
@@ -57,19 +55,19 @@ mod sys {
 			out_len_ptr: *mut u32,
 		) -> ReturnCode;
 		pub fn get_storage_or_zero(flags: u32, key_ptr: *const u8, out_ptr: *mut u8);
-		pub fn contains_storage(flags: u32, key_ptr: *const u8, key_len: u32) -> ReturnCode;
-		pub fn take_storage(
-			flags: u32,
-			key_ptr: *const u8,
-			key_len: u32,
-			out_ptr: *mut u8,
-			out_len_ptr: *mut u32,
-		) -> ReturnCode;
 		pub fn call(
 			flags_and_callee: u64,
 			ref_time_limit: u64,
 			proof_size_limit: u64,
 			deposit_and_value: u64,
+			input_data: u64,
+			output_data: u64,
+		) -> ReturnCode;
+		pub fn call_evm(
+			flags: u32,
+			callee: u32,
+			value_ptr: u32,
+			gas: u64,
 			input_data: u64,
 			output_data: u64,
 		) -> ReturnCode;
@@ -89,6 +87,13 @@ mod sys {
 			output_data: u64,
 			address_and_salt: u64,
 		) -> ReturnCode;
+		pub fn delegate_call_evm(
+			flags: u32,
+			callee: u32,
+			gas: u64,
+			input_data: u64,
+			output_data: u64,
+		) -> ReturnCode;
 		pub fn terminate(beneficiary_ptr: *const u8);
 		pub fn call_data_copy(out_ptr: *mut u8, out_len: u32, offset: u32);
 		pub fn call_data_load(out_ptr: *mut u8, offset: u32);
@@ -98,7 +103,6 @@ mod sys {
 		pub fn code_hash(address_ptr: *const u8, out_ptr: *mut u8);
 		pub fn code_size(address_ptr: *const u8) -> u64;
 		pub fn address(out_ptr: *mut u8);
-		pub fn weight_to_fee(ref_time: u64, proof_size: u64, out_ptr: *mut u8);
 		pub fn ref_time_left() -> u64;
 		pub fn get_immutable_data(out_ptr: *mut u8, out_len_ptr: *mut u32);
 		pub fn set_immutable_data(ptr: *const u8, len: u32);
@@ -121,17 +125,10 @@ mod sys {
 		pub fn block_hash(block_number_ptr: *const u8, out_ptr: *mut u8);
 		pub fn block_author(out_ptr: *mut u8);
 		pub fn hash_keccak_256(input_ptr: *const u8, input_len: u32, out_ptr: *mut u8);
-		pub fn sr25519_verify(
-			signature_ptr: *const u8,
-			pub_key_ptr: *const u8,
-			message_len: u32,
-			message_ptr: *const u8,
-		) -> ReturnCode;
-		pub fn set_code_hash(code_hash_ptr: *const u8);
-		pub fn ecdsa_to_eth_address(key_ptr: *const u8, out_ptr: *mut u8) -> ReturnCode;
 		pub fn instantiation_nonce() -> u64;
 		pub fn return_data_size() -> u64;
 		pub fn return_data_copy(out_ptr: *mut u8, out_len_ptr: *mut u32, offset: u32);
+		pub fn consume_all_gas();
 	}
 }
 
@@ -236,6 +233,36 @@ impl HostFn for HostFnImpl {
 		ret_code.into()
 	}
 
+	fn call_evm(
+		flags: CallFlags,
+		callee: &[u8; 20],
+		gas: u64,
+		value_ptr: &[u8; 32],
+		input: &[u8],
+		mut output: Option<&mut &mut [u8]>,
+	) -> Result {
+		let input_data = pack_hi_lo(input.len() as _, input.as_ptr() as _);
+		let (output_ptr, mut output_len) = ptr_len_or_sentinel(&mut output);
+		let output_data = pack_hi_lo(&mut output_len as *mut _ as _, output_ptr as _);
+
+		let ret_code = unsafe {
+			sys::call_evm(
+				flags.bits(),
+				callee.as_ptr() as _,
+				value_ptr.as_ptr() as _,
+				gas,
+				input_data,
+				output_data,
+			)
+		};
+
+		if let Some(ref mut output) = output {
+			extract_from_slice(output, output_len as usize);
+		}
+
+		ret_code.into()
+	}
+
 	fn delegate_call(
 		flags: CallFlags,
 		address: &[u8; 20],
@@ -258,6 +285,34 @@ impl HostFn for HostFnImpl {
 				ref_time_limit,
 				proof_size_limit,
 				deposit_limit_ptr as _,
+				input_data,
+				output_data,
+			)
+		};
+
+		if let Some(ref mut output) = output {
+			extract_from_slice(output, output_len as usize);
+		}
+
+		ret_code.into()
+	}
+
+	fn delegate_call_evm(
+		flags: CallFlags,
+		address: &[u8; 20],
+		gas: u64,
+		input: &[u8],
+		mut output: Option<&mut &mut [u8]>,
+	) -> Result {
+		let input_data = pack_hi_lo(input.len() as u32, input.as_ptr() as u32);
+		let (output_ptr, mut output_len) = ptr_len_or_sentinel(&mut output);
+		let output_data = pack_hi_lo(&mut output_len as *mut _ as u32, output_ptr as u32);
+
+		let ret_code = unsafe {
+			sys::delegate_call_evm(
+				flags.bits(),
+				address.as_ptr() as _,
+				gas,
 				input_data,
 				output_data,
 			)
@@ -387,10 +442,6 @@ impl HostFn for HostFnImpl {
 		unsafe { sys::block_author(output.as_mut_ptr()) }
 	}
 
-	fn weight_to_fee(ref_time_limit: u64, proof_size_limit: u64, output: &mut [u8; 32]) {
-		unsafe { sys::weight_to_fee(ref_time_limit, proof_size_limit, output.as_mut_ptr()) };
-	}
-
 	fn hash_keccak_256(input: &[u8], output: &mut [u8; 32]) {
 		unsafe { sys::hash_keccak_256(input.as_ptr(), input.len() as u32, output.as_mut_ptr()) }
 	}
@@ -429,7 +480,8 @@ impl HostFn for HostFnImpl {
 		extract_from_slice(output, output_len as usize);
 	}
 
-	fn ref_time_left() -> u64 {
+	fn gas_left() -> u64 {
+		// The name is only for historical reasons; it's the correct method.
 		unsafe { sys::ref_time_left() }
 	}
 
@@ -442,62 +494,11 @@ impl HostFn for HostFnImpl {
 		unsafe { sys::call_data_copy(output.as_mut_ptr(), len, offset) };
 	}
 
-	#[unstable_hostfn]
-	fn clear_storage(flags: StorageFlags, key: &[u8]) -> Option<u32> {
-		let ret_code = unsafe { sys::clear_storage(flags.bits(), key.as_ptr(), key.len() as u32) };
-		ret_code.into()
+	fn consume_all_gas() -> ! {
+		unsafe { sys::consume_all_gas() }
+		unreachable!("consume_all_gas does not return");
 	}
 
-	#[unstable_hostfn]
-	fn contains_storage(flags: StorageFlags, key: &[u8]) -> Option<u32> {
-		let ret_code =
-			unsafe { sys::contains_storage(flags.bits(), key.as_ptr(), key.len() as u32) };
-		ret_code.into()
-	}
-
-	#[unstable_hostfn]
-	fn ecdsa_to_eth_address(pubkey: &[u8; 33], output: &mut [u8; 20]) -> Result {
-		let ret_code = unsafe { sys::ecdsa_to_eth_address(pubkey.as_ptr(), output.as_mut_ptr()) };
-		ret_code.into()
-	}
-
-	#[unstable_hostfn]
-	fn set_code_hash(code_hash: &[u8; 32]) {
-		unsafe { sys::set_code_hash(code_hash.as_ptr()) }
-	}
-
-	#[unstable_hostfn]
-	fn sr25519_verify(signature: &[u8; 64], message: &[u8], pub_key: &[u8; 32]) -> Result {
-		let ret_code = unsafe {
-			sys::sr25519_verify(
-				signature.as_ptr(),
-				pub_key.as_ptr(),
-				message.len() as u32,
-				message.as_ptr(),
-			)
-		};
-		ret_code.into()
-	}
-
-	#[unstable_hostfn]
-	fn take_storage(flags: StorageFlags, key: &[u8], output: &mut &mut [u8]) -> Result {
-		let mut output_len = output.len() as u32;
-		let ret_code = {
-			unsafe {
-				sys::take_storage(
-					flags.bits(),
-					key.as_ptr(),
-					key.len() as u32,
-					output.as_mut_ptr(),
-					&mut output_len,
-				)
-			}
-		};
-		extract_from_slice(output, output_len as usize);
-		ret_code.into()
-	}
-
-	#[unstable_hostfn]
 	fn terminate(beneficiary: &[u8; 20]) -> ! {
 		unsafe { sys::terminate(beneficiary.as_ptr()) }
 		panic!("terminate does not return");

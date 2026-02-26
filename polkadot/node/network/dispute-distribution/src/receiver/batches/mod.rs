@@ -97,9 +97,9 @@ impl Batches {
 		&mut self,
 		candidate_hash: CandidateHash,
 		candidate_receipt: CandidateReceipt,
-	) -> JfyiResult<FoundBatch> {
+	) -> JfyiResult<FoundBatch<'_>> {
 		if self.batches.len() >= MAX_BATCHES {
-			return Err(JfyiError::MaxBatchLimitReached)
+			return Err(JfyiError::MaxBatchLimitReached);
 		}
 		debug_assert!(candidate_hash == candidate_receipt.hash());
 		let result = match self.batches.entry(candidate_hash) {

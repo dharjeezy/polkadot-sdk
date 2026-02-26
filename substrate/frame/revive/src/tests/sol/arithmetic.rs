@@ -16,44 +16,40 @@
 // limitations under the License.
 
 use crate::{
-	evm::decode_revert_reason,
-	test_utils::{builder::Contract, ALICE},
-	tests::{builder, ExtBuilder, Test},
 	Code, Config,
+	evm::decode_revert_reason,
+	test_utils::{ALICE, builder::Contract},
+	tests::{ExtBuilder, Test, builder},
 };
 
 use alloy_core::sol_types::SolInterface;
 use frame_support::traits::fungible::Mutate;
-use pallet_revive_fixtures::{compile_module_with_type, Arithmetic, FixtureType};
+use pallet_revive_fixtures::{Arithmetic, FixtureType, compile_module_with_type};
+use test_case::test_case;
 
-#[test]
-fn arithmetic_works() {
-	for fixture_type in [FixtureType::Solc, FixtureType::Resolc] {
-		let (code, _) = compile_module_with_type("Arithmetic", fixture_type).unwrap();
-		ExtBuilder::default().build().execute_with(|| {
-			let _ = <Test as Config>::Currency::set_balance(&ALICE, 100_000_000_000);
-			let Contract { addr, .. } =
-				builder::bare_instantiate(Code::Upload(code)).build_and_unwrap_contract();
+#[test_case(FixtureType::Solc)]
+#[test_case(FixtureType::Resolc)]
+fn arithmetic_works(fixture_type: FixtureType) {
+	let (code, _) = compile_module_with_type("Arithmetic", fixture_type).unwrap();
+	ExtBuilder::default().build().execute_with(|| {
+		let _ = <Test as Config>::Currency::set_balance(&ALICE, 100_000_000_000);
+		let Contract { addr, .. } =
+			builder::bare_instantiate(Code::Upload(code)).build_and_unwrap_contract();
 
-			{
-				let result = builder::bare_call(addr)
-					.data(
-						Arithmetic::ArithmeticCalls::testArithmetic(
-							Arithmetic::testArithmeticCall {},
-						)
+		{
+			let result = builder::bare_call(addr)
+				.data(
+					Arithmetic::ArithmeticCalls::testArithmetic(Arithmetic::testArithmeticCall {})
 						.abi_encode(),
-					)
-					.build_and_unwrap_result();
-				if result.did_revert() {
-					if let Some(revert_msg) = decode_revert_reason(&result.data) {
-						log::error!("Revert message: {}", revert_msg);
-					} else {
-						log::error!("Revert without message, raw data: {:?}", result.data);
-					}
+				)
+				.build_and_unwrap_result();
+			if result.did_revert() {
+				if let Some(revert_msg) = decode_revert_reason(&result.data) {
+					panic!("Revert message: {revert_msg}");
+				} else {
+					panic!("Revert without message, raw data: {:?}", result.data);
 				}
-
-				assert!(!result.did_revert(), "arithmetic test reverted");
 			}
-		});
-	}
+		}
+	});
 }

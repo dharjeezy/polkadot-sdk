@@ -47,6 +47,7 @@ use sc_transaction_pool_api::OffchainTransactionPoolFactory;
 use sp_api::ProvideRuntimeApi;
 use sp_core::crypto::Pair;
 use sp_runtime::{generic, traits::Block as BlockT, SaturatedConversion};
+use sp_transaction_storage_proof::runtime_api::TransactionStorageApi;
 use std::{path::Path, sync::Arc};
 
 /// Host functions required for kitchensink runtime and Substrate node.
@@ -140,6 +141,7 @@ pub fn create_extrinsic(
 				>::from(tip, None),
 			),
 			frame_metadata_hash_extension::CheckMetadataHash::new(false),
+			pallet_revive::evm::tx_extension::SetOrigin::<kitchensink_runtime::Runtime>::default(),
 			frame_system::WeightReclaim::<kitchensink_runtime::Runtime>::new(),
 		);
 
@@ -157,6 +159,7 @@ pub fn create_extrinsic(
 			(),
 			(),
 			None,
+			(),
 			(),
 		),
 	);
@@ -224,6 +227,7 @@ pub fn new_partial(
 			config,
 			telemetry.as_ref().map(|(_, telemetry)| telemetry.handle()),
 			executor,
+			vec![Arc::new(grandpa::GrandpaPruningFilter)],
 		)?;
 	let client = Arc::new(client);
 
@@ -301,7 +305,7 @@ pub fn new_partial(
 		client.clone(),
 		keystore_container.local_keystore(),
 		config.prometheus_registry(),
-		&task_manager.spawn_handle(),
+		Box::new(task_manager.spawn_handle()),
 	)
 	.map_err(|e| ServiceError::Other(format!("Statement store error: {:?}", e)))?;
 
@@ -353,9 +357,12 @@ pub fn new_partial(
 						beefy_best_block_stream: beefy_rpc_links
 							.from_voter_best_beefy_stream
 							.clone(),
+						subscription_executor: subscription_executor.clone(),
+					},
+					statement_store_deps: node_rpc::StatementStoreDeps {
+						statement_store: rpc_statement_store.clone(),
 						subscription_executor,
 					},
-					statement_store: rpc_statement_store.clone(),
 					backend: rpc_backend.clone(),
 					mixnet_api: mixnet_api.as_ref().cloned(),
 				};
@@ -406,6 +413,7 @@ pub fn new_full_base<N: NetworkBackend<Block, <Block as BlockT>::Hash>>(
 	config: Configuration,
 	mixnet_config: Option<sc_mixnet::Config>,
 	disable_hardware_benchmarks: bool,
+	statement_network_workers: usize,
 	with_startup_data: impl FnOnce(
 		&sc_consensus_babe::BabeBlockImport<
 			Block,
@@ -529,6 +537,7 @@ pub fn new_full_base<N: NetworkBackend<Block, <Block as BlockT>::Hash>>(
 			client: client.clone(),
 			transaction_pool: transaction_pool.clone(),
 			spawn_handle: task_manager.spawn_handle(),
+			spawn_essential_handle: task_manager.spawn_essential_handle(),
 			import_queue,
 			block_announce_validator_builder: None,
 			warp_sync_config: Some(WarpSyncConfig::WithProvider(warp_sync)),
@@ -566,6 +575,7 @@ pub fn new_full_base<N: NetworkBackend<Block, <Block as BlockT>::Hash>>(
 		tx_handler_controller,
 		sync_service: sync_service.clone(),
 		telemetry: telemetry.as_mut(),
+		tracing_execute_block: None,
 	})?;
 
 	if let Some(hwbench) = hwbench {
@@ -628,6 +638,8 @@ pub fn new_full_base<N: NetworkBackend<Block, <Block as BlockT>::Hash>>(
 						sp_transaction_storage_proof::registration::new_data_provider(
 							&*client_clone,
 							&parent,
+							// Use `unwrap_or` in case the runtime api is not available.
+							client_clone.runtime_api().retention_period(parent).unwrap_or(100800),
 						)?;
 
 					Ok((slot, timestamp, storage_proof))
@@ -783,6 +795,7 @@ pub fn new_full_base<N: NetworkBackend<Block, <Block as BlockT>::Hash>>(
 		statement_store.clone(),
 		prometheus_registry.as_ref(),
 		statement_protocol_executor,
+		statement_network_workers,
 	)?;
 	task_manager.spawn_handle().spawn(
 		"network-statement-handler",
@@ -834,6 +847,7 @@ pub fn new_full(config: Configuration, cli: Cli) -> Result<TaskManager, ServiceE
 				config,
 				mixnet_config,
 				cli.no_hardware_benchmarks,
+				cli.statement_network_workers,
 				|_, _| (),
 			)
 			.map(|NewFullBase { task_manager, .. }| task_manager)?;
@@ -844,6 +858,7 @@ pub fn new_full(config: Configuration, cli: Cli) -> Result<TaskManager, ServiceE
 				config,
 				mixnet_config,
 				cli.no_hardware_benchmarks,
+				cli.statement_network_workers,
 				|_, _| (),
 			)
 			.map(|NewFullBase { task_manager, .. }| task_manager)?;
@@ -931,6 +946,7 @@ mod tests {
 						config,
 						None,
 						false,
+						1,
 						|block_import: &sc_consensus_babe::BabeBlockImport<Block, _, _, _, _>,
 						 babe_link: &sc_consensus_babe::BabeLink<Block>| {
 							setup_handles = Some((block_import.clone(), babe_link.clone()));
@@ -1015,10 +1031,14 @@ mod tests {
 					let proposer = proposer_factory.init(&parent_header).await.unwrap();
 					Proposer::propose(
 						proposer,
-						inherent_data,
-						digest,
-						std::time::Duration::from_secs(1),
-						None,
+						sp_consensus::ProposeArgs {
+							inherent_data,
+							inherent_digests: digest,
+							max_duration: std::time::Duration::from_secs(1),
+							block_size_limit: None,
+							storage_proof_recorder: None,
+							extra_extensions: Default::default(),
+						},
 					)
 					.await
 				})
@@ -1077,6 +1097,7 @@ mod tests {
 				let tx_payment = pallet_skip_feeless_payment::SkipCheckIfFeeless::from(
 					pallet_asset_conversion_tx_payment::ChargeAssetTxPayment::from(0, None),
 				);
+				let set_eth_origin = pallet_revive::evm::tx_extension::SetOrigin::default();
 				let weight_reclaim = frame_system::WeightReclaim::new();
 				let metadata_hash = frame_metadata_hash_extension::CheckMetadataHash::new(false);
 				let tx_ext: TxExtension = (
@@ -1090,6 +1111,7 @@ mod tests {
 					check_weight,
 					tx_payment,
 					metadata_hash,
+					set_eth_origin,
 					weight_reclaim,
 				);
 				let raw_payload = SignedPayload::from_raw(
@@ -1106,6 +1128,7 @@ mod tests {
 						(),
 						(),
 						None,
+						(),
 						(),
 					),
 				);
@@ -1139,6 +1162,7 @@ mod tests {
 						config,
 						None,
 						false,
+						1,
 						|_, _| (),
 					)?;
 				Ok(sc_service_test::TestNetComponents::new(
