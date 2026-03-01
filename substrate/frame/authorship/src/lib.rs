@@ -102,8 +102,8 @@ impl<T: Config> Pallet<T> {
 	///
 	/// # Invariants
 	///
-	/// * If `Author` storage contains a value, it must match the author derived from
-	///   the current block's digest via `FindAuthor`.
+	/// * If `Author` storage contains a value, it must match the author derived from the current
+	///   block's digest via `FindAuthor`.
 	pub fn do_try_state() -> Result<(), sp_runtime::TryRuntimeError> {
 		use frame_support::ensure;
 
