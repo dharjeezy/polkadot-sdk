@@ -949,51 +949,41 @@ impl<T: Config> Pallet<T> {
 	///   start block.
 	pub fn do_try_state() -> Result<(), sp_runtime::TryRuntimeError> {
 		use frame_support::ensure;
-		use sp_runtime::TryRuntimeError;
 
 		ensure!(
 			Authorities::<T>::decode_len().unwrap_or(0) as u32 <= T::MaxAuthorities::get(),
-			TryRuntimeError::Other("Authorities length exceeds MaxAuthorities")
+			"Authorities length exceeds MaxAuthorities"
 		);
 
 		ensure!(
 			NextAuthorities::<T>::decode_len().unwrap_or(0) as u32 <= T::MaxAuthorities::get(),
-			TryRuntimeError::Other("NextAuthorities length exceeds MaxAuthorities")
+			"NextAuthorities length exceeds MaxAuthorities"
 		);
 
 		ensure!(
 			EpochConfig::<T>::get().is_some(),
-			TryRuntimeError::Other("EpochConfig must be initialized and never be None")
+			"EpochConfig must be initialized and never be None"
 		);
 
 		let genesis_slot = *GenesisSlot::<T>::get();
-		if genesis_slot != 0 {
-			ensure!(
-				*CurrentSlot::<T>::get() >= genesis_slot,
-				TryRuntimeError::Other("CurrentSlot must be >= GenesisSlot")
-			);
-		}
+		ensure!(*CurrentSlot::<T>::get() >= genesis_slot, "CurrentSlot must be >= GenesisSlot");
 
 		let skipped_epochs = SkippedEpochs::<T>::get();
 		ensure!(
 			skipped_epochs.windows(2).all(|w| w[0].0 < w[1].0),
-			TryRuntimeError::Other(
-				"SkippedEpochs must be sorted in ascending order by epoch index"
-			)
+			"SkippedEpochs must be sorted in ascending order by epoch index"
 		);
 		ensure!(
 			skipped_epochs
 				.iter()
 				.all(|(epoch_index, session_index)| *epoch_index >= *session_index as u64),
-			TryRuntimeError::Other("SkippedEpochs entry has epoch_index < session_index")
+			"SkippedEpochs entry has epoch_index < session_index"
 		);
 
 		let (previous_epoch_start, current_epoch_start) = EpochStart::<T>::get();
 		ensure!(
 			previous_epoch_start <= current_epoch_start,
-			TryRuntimeError::Other(
-				"EpochStart previous epoch start must be <= current epoch start"
-			)
+			"EpochStart previous epoch start must be <= current epoch start"
 		);
 
 		Ok(())
