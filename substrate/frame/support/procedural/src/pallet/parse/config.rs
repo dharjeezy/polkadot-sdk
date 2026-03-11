@@ -44,25 +44,44 @@ mod keyword {
 pub struct ConstantAttr {
 	pub keyword: keyword::constant,
 	pub value_path: Option<Path>,
+	/// Whether the value_path is a function call (i.e., followed by `()`).
+	pub is_fn_call: bool,
 }
 
 impl syn::parse::Parse for ConstantAttr {
 	fn parse(input: syn::parse::ParseStream) -> syn::Result<Self> {
 		let keyword = input.parse::<keyword::constant>()?;
-		let value_path = if input.peek(token::Paren) {
+		let (value_path, is_fn_call) = if input.peek(token::Paren) {
 			let content;
 			parenthesized!(content in input);
 			let path = content.parse::<Path>()?;
 
 			if path.leading_colon.is_none() {
-				let msg = "expected a path starting with `::`, e.g., `(::IDENTIFIER)`";
+				let msg = "expected a path starting with `::`, e.g., \
+					`(::IDENTIFIER)` or `(::function_name())`";
 				return Err(syn::Error::new(path.span(), msg));
 			}
-			Some(path)
+
+			// Support function call syntax: `::function_name()`
+			let is_fn_call = if content.peek(token::Paren) {
+				let args;
+				parenthesized!(args in content);
+				if !args.is_empty() {
+					return Err(syn::Error::new(
+						args.span(),
+						"function call arguments are not supported",
+					));
+				}
+				true
+			} else {
+				false
+			};
+
+			(Some(path), is_fn_call)
 		} else {
-			None
+			(None, false)
 		};
-		Ok(Self { keyword, value_path })
+		Ok(Self { keyword, value_path, is_fn_call })
 	}
 }
 
@@ -129,9 +148,9 @@ pub struct ConstMetadataDef {
 	/// `T`. For `Get<T>` constants this is the `Get<T>` bound; for `value_path` constants this
 	/// is the first trait bound.
 	pub trait_bound: syn::TypeParamBound,
-	/// The path to the constant value, e.g. `::IDENTIFIER`.
+	/// The access path to the constant value, e.g. `::IDENTIFIER` or `::function_name()`.
 	/// If `None`, the macro will default to `::get()`.
-	pub value_path: Option<Path>,
+	pub value_path: Option<proc_macro2::TokenStream>,
 }
 
 /// Parse for `#[pallet::disable_frame_system_supertrait_check]`
@@ -503,12 +522,22 @@ impl ConfigDef {
 							in valid trait bound",
 						);
 
+						// Convert Path + is_fn_call into a TokenStream
+						let value_path =
+							constant_attr.value_path.map(|path| {
+								if constant_attr.is_fn_call {
+									quote::quote!(#path())
+								} else {
+									quote::quote!(#path)
+								}
+							});
+
 						consts_metadata.push(ConstMetadataDef {
 							ident: typ.ident.clone(),
 							doc: get_doc_literals(&typ.attrs),
 							attrs: typ.attrs.clone(),
 							trait_bound,
-							value_path: constant_attr.value_path,
+							value_path,
 						});
 					},
 					(PalletAttrType::Constant(_), _) =>
