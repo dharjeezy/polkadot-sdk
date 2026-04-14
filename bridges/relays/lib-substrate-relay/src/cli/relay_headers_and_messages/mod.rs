@@ -31,9 +31,8 @@ pub mod relay_to_relay;
 pub mod relay_to_parachain;
 
 use async_trait::async_trait;
-use codec::{Codec, EncodeLike};
+use clap::Parser;
 use std::{fmt::Debug, marker::PhantomData, sync::Arc};
-use structopt::StructOpt;
 
 use futures::{FutureExt, TryFutureExt};
 
@@ -47,7 +46,6 @@ use crate::{
 	HeadersToRelay, TaggedAccount, TransactionParams,
 };
 use bp_runtime::BalanceOf;
-use messages_relay::Labeled;
 use relay_substrate_client::{
 	AccountIdOf, AccountKeyPairOf, Chain, ChainWithBalances, ChainWithMessages,
 	ChainWithRuntimeVersion, ChainWithTransactions,
@@ -57,20 +55,20 @@ use sp_core::Pair;
 use sp_runtime::traits::TryConvert;
 
 /// Parameters that have the same names across all bridges.
-#[derive(Debug, PartialEq, StructOpt)]
+#[derive(Debug, PartialEq, Parser)]
 pub struct HeadersAndMessagesSharedParams {
 	/// Hex-encoded lane identifiers that should be served by the complex relay.
-	#[structopt(long)]
+	#[arg(long)]
 	pub lane: Vec<HexLaneId>,
 	/// If passed, only mandatory headers (headers that are changing the GRANDPA authorities set)
 	/// are relayed.
-	#[structopt(long)]
+	#[arg(long)]
 	pub only_mandatory_headers: bool,
 	/// If passed, only free headers (mandatory and every Nth header, if configured in runtime)
 	/// are relayed. Overrides `only_mandatory_headers`.
-	#[structopt(long)]
+	#[arg(long)]
 	pub only_free_headers: bool,
-	#[structopt(flatten)]
+	#[command(flatten)]
 	/// Prometheus metrics params.
 	pub prometheus_params: PrometheusParams,
 }
@@ -239,20 +237,9 @@ where
 		+ ChainWithRuntimeVersion;
 
 	/// Left to Right bridge.
-	type L2R: MessagesCliBridge<Source = Self::Left, Target = Self::Right, LaneId = Self::LaneId>;
+	type L2R: MessagesCliBridge<Source = Self::Left, Target = Self::Right>;
 	/// Right to Left bridge
-	type R2L: MessagesCliBridge<Source = Self::Right, Target = Self::Left, LaneId = Self::LaneId>;
-	/// Lane identifier type.
-	type LaneId: Clone
-		+ Copy
-		+ Debug
-		+ Codec
-		+ EncodeLike
-		+ Send
-		+ Sync
-		+ Labeled
-		+ TryFrom<Vec<u8>>
-		+ Default;
+	type R2L: MessagesCliBridge<Source = Self::Right, Target = Self::Left>;
 
 	/// Construct new bridge.
 	fn new(params: <Self::Base as Full2WayBridgeBase>::Params) -> anyhow::Result<Self>;
@@ -264,7 +251,7 @@ where
 	fn mut_base(&mut self) -> &mut Self::Base;
 
 	/// Creates and returns Left to Right complex relay.
-	fn left_to_right(&mut self) -> FullBridge<Self::Left, Self::Right, Self::L2R> {
+	fn left_to_right(&mut self) -> FullBridge<'_, Self::Left, Self::Right, Self::L2R> {
 		let common = self.mut_base().mut_common();
 		FullBridge::<_, _, Self::L2R>::new(
 			&mut common.left,
@@ -274,7 +261,7 @@ where
 	}
 
 	/// Creates and returns Right to Left complex relay.
-	fn right_to_left(&mut self) -> FullBridge<Self::Right, Self::Left, Self::R2L> {
+	fn right_to_left(&mut self) -> FullBridge<'_, Self::Right, Self::Left, Self::R2L> {
 		let common = self.mut_base().mut_common();
 		FullBridge::<_, _, Self::R2L>::new(
 			&mut common.right,
@@ -303,7 +290,7 @@ where
 			self.mut_base().start_on_demand_headers_relayers().await?;
 
 		// add balance-related metrics
-		let lanes: Vec<Self::LaneId> = self
+		let lanes_l2r: Vec<MessagesLaneIdOf<Self::L2R>> = self
 			.base()
 			.common()
 			.shared
@@ -312,28 +299,41 @@ where
 			.cloned()
 			.map(HexLaneId::try_convert)
 			.collect::<Result<Vec<_>, HexLaneId>>()
-			.expect("");
+			.map_err(|e| {
+				anyhow::format_err!("Conversion failed for L2R lanes with error: {:?}!", e)
+			})?;
+		let lanes_r2l: Vec<MessagesLaneIdOf<Self::R2L>> = self
+			.base()
+			.common()
+			.shared
+			.lane
+			.iter()
+			.cloned()
+			.map(HexLaneId::try_convert)
+			.collect::<Result<Vec<_>, HexLaneId>>()
+			.map_err(|e| {
+				anyhow::format_err!("Conversion failed for R2L lanes with error: {:?}!", e)
+			})?;
 		{
 			let common = self.mut_base().mut_common();
-			crate::messages::metrics::add_relay_balances_metrics::<
-				_,
-				Self::Right,
-				MessagesLaneIdOf<Self::L2R>,
-			>(common.left.client.clone(), &common.metrics_params, &common.left.accounts, &lanes)
+			crate::messages::metrics::add_relay_balances_metrics::<_>(
+				common.left.client.clone(),
+				&common.metrics_params,
+				&common.left.accounts,
+			)
 			.await?;
-			crate::messages::metrics::add_relay_balances_metrics::<
-				_,
-				Self::Left,
-				MessagesLaneIdOf<Self::R2L>,
-			>(
-				common.right.client.clone(), &common.metrics_params, &common.right.accounts, &lanes
+			crate::messages::metrics::add_relay_balances_metrics::<_>(
+				common.right.client.clone(),
+				&common.metrics_params,
+				&common.right.accounts,
 			)
 			.await?;
 		}
 
 		// Need 2x capacity since we consider both directions for each lane
-		let mut message_relays = Vec::with_capacity(lanes.len() * 2);
-		for lane in lanes {
+		let mut message_relays =
+			Vec::with_capacity(lanes_l2r.len().saturating_add(lanes_r2l.len()));
+		for lane in lanes_l2r {
 			let left_to_right_messages =
 				crate::messages::run::<<Self::L2R as MessagesCliBridge>::MessagesLane, _, _>(
 					self.left_to_right().messages_relay_params(
@@ -346,7 +346,8 @@ where
 				.map_err(|e| anyhow::format_err!("{}", e))
 				.boxed();
 			message_relays.push(left_to_right_messages);
-
+		}
+		for lane in lanes_r2l {
 			let right_to_left_messages =
 				crate::messages::run::<<Self::R2L as MessagesCliBridge>::MessagesLane, _, _>(
 					self.right_to_left().messages_relay_params(
@@ -412,32 +413,24 @@ mod tests {
 			Polkadot
 		);
 
-		let res = BridgeHubKusamaBridgeHubPolkadotHeadersAndMessages::from_iter(vec![
+		let res = BridgeHubKusamaBridgeHubPolkadotHeadersAndMessages::parse_from(vec![
 			"bridge-hub-kusama-bridge-hub-polkadot-headers-and-messages",
-			"--bridge-hub-kusama-host",
-			"bridge-hub-kusama-node-collator1",
-			"--bridge-hub-kusama-port",
-			"9944",
+			"--bridge-hub-kusama-uri",
+			"ws://bridge-hub-kusama-node-collator1:9944",
 			"--bridge-hub-kusama-signer",
 			"//Iden",
 			"--bridge-hub-kusama-transactions-mortality",
 			"64",
-			"--kusama-host",
-			"kusama-alice",
-			"--kusama-port",
-			"9944",
-			"--bridge-hub-polkadot-host",
-			"bridge-hub-polkadot-collator1",
-			"--bridge-hub-polkadot-port",
-			"9944",
+			"--kusama-uri",
+			"ws://kusama-alice:9944",
+			"--bridge-hub-polkadot-uri",
+			"ws://bridge-hub-polkadot-collator1:9944",
 			"--bridge-hub-polkadot-signer",
 			"//George",
 			"--bridge-hub-polkadot-transactions-mortality",
 			"64",
-			"--polkadot-host",
-			"polkadot-alice",
-			"--polkadot-port",
-			"9944",
+			"--polkadot-uri",
+			"ws://polkadot-alice:9944",
 			"--lane",
 			"0000000000000000000000000000000000000000000000000000000000000000",
 			"--prometheus-host",
@@ -459,11 +452,7 @@ mod tests {
 					},
 				},
 				left: BridgeHubKusamaConnectionParams {
-					bridge_hub_kusama_uri: None,
-					bridge_hub_kusama_host: "bridge-hub-kusama-node-collator1".into(),
-					bridge_hub_kusama_port: 9944,
-					bridge_hub_kusama_path: None,
-					bridge_hub_kusama_secure: false,
+					bridge_hub_kusama_uri: "ws://bridge-hub-kusama-node-collator1:9944".into(),
 					bridge_hub_kusama_runtime_version: BridgeHubKusamaRuntimeVersionParams {
 						bridge_hub_kusama_version_mode: RuntimeVersionType::Bundle,
 						bridge_hub_kusama_spec_version: None,
@@ -478,11 +467,7 @@ mod tests {
 					bridge_hub_kusama_transactions_mortality: Some(64),
 				},
 				left_relay: KusamaConnectionParams {
-					kusama_uri: None,
-					kusama_host: "kusama-alice".into(),
-					kusama_port: 9944,
-					kusama_path: None,
-					kusama_secure: false,
+					kusama_uri: "ws://kusama-alice:9944".into(),
 					kusama_runtime_version: KusamaRuntimeVersionParams {
 						kusama_version_mode: RuntimeVersionType::Bundle,
 						kusama_spec_version: None,
@@ -490,11 +475,7 @@ mod tests {
 					},
 				},
 				right: BridgeHubPolkadotConnectionParams {
-					bridge_hub_polkadot_uri: None,
-					bridge_hub_polkadot_host: "bridge-hub-polkadot-collator1".into(),
-					bridge_hub_polkadot_port: 9944,
-					bridge_hub_polkadot_path: None,
-					bridge_hub_polkadot_secure: false,
+					bridge_hub_polkadot_uri: "ws://bridge-hub-polkadot-collator1:9944".into(),
 					bridge_hub_polkadot_runtime_version: BridgeHubPolkadotRuntimeVersionParams {
 						bridge_hub_polkadot_version_mode: RuntimeVersionType::Bundle,
 						bridge_hub_polkadot_spec_version: None,
@@ -509,11 +490,7 @@ mod tests {
 					bridge_hub_polkadot_transactions_mortality: Some(64),
 				},
 				right_relay: PolkadotConnectionParams {
-					polkadot_uri: None,
-					polkadot_host: "polkadot-alice".into(),
-					polkadot_port: 9944,
-					polkadot_path: None,
-					polkadot_secure: false,
+					polkadot_uri: "ws://polkadot-alice:9944".into(),
 					polkadot_runtime_version: PolkadotRuntimeVersionParams {
 						polkadot_version_mode: RuntimeVersionType::Bundle,
 						polkadot_spec_version: None,

@@ -97,10 +97,10 @@ where
 		_provenance: Provenance,
 	) -> DepositConsequence {
 		if !Self::asset_exists(asset) {
-			return DepositConsequence::UnknownAsset
+			return DepositConsequence::UnknownAsset;
 		}
 		if amount + Self::balance(asset, who) < Self::minimum_balance(asset) {
-			return DepositConsequence::BelowMinimum
+			return DepositConsequence::BelowMinimum;
 		}
 		DepositConsequence::Success
 	}
@@ -112,10 +112,10 @@ where
 	) -> WithdrawConsequence<Self::Balance> {
 		if Self::reducible_balance(asset, who, Preservation::Expendable, Fortitude::Polite) < amount
 		{
-			return WithdrawConsequence::BalanceLow
+			return WithdrawConsequence::BalanceLow;
 		}
 		if Self::total_balance(asset, who) < Self::minimum_balance(asset) + amount {
-			return WithdrawConsequence::WouldDie
+			return WithdrawConsequence::WouldDie;
 		}
 		WithdrawConsequence::Success
 	}
@@ -263,6 +263,20 @@ impl<
 		MinimumBalance: TypedGet,
 		HoldReason: Encode + Decode + TypeInfo + 'static,
 	> fungibles::MutateHold<AccountId>
+	for TestFungibles<Instance, AccountId, AssetId, MinimumBalance, HoldReason>
+where
+	MinimumBalance::Type: tokens::Balance,
+{
+}
+
+impl<
+		Instance: Get<u32>,
+		AccountId: Encode,
+		AssetId: tokens::AssetId + Copy,
+		MinimumBalance: TypedGet,
+		HoldReason: Encode + Decode + TypeInfo + 'static,
+		Balance: tokens::Balance,
+	> fungibles::hold::DoneSlash<AssetId, HoldReason, AccountId, Balance>
 	for TestFungibles<Instance, AccountId, AssetId, MinimumBalance, HoldReason>
 where
 	MinimumBalance::Type: tokens::Balance,

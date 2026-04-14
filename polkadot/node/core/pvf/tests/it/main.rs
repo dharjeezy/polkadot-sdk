@@ -24,12 +24,19 @@ use polkadot_node_core_pvf::{
 	PossiblyInvalidError, PrepareError, PrepareJobKind, PvfPrepData, ValidationError,
 	ValidationHost, JOB_TIMEOUT_WALL_CLOCK_FACTOR,
 };
-use polkadot_node_primitives::{PoV, POV_BOMB_LIMIT, VALIDATION_CODE_BOMB_LIMIT};
+use polkadot_node_core_pvf_common::{
+	compute_checksum, execute::ValidationContext, ArtifactChecksum,
+};
+use polkadot_node_primitives::{PoV, POV_BOMB_LIMIT};
+use polkadot_node_subsystem::messages::PvfExecKind;
 use polkadot_parachain_primitives::primitives::{BlockData, ValidationResult};
 use polkadot_primitives::{
-	ExecutorParam, ExecutorParams, PersistedValidationData, PvfExecKind, PvfPrepKind,
+	ExecutorParam, ExecutorParams, Hash, PersistedValidationData, PvfExecKind as RuntimePvfExecKind,
 };
+use polkadot_primitives_test_helpers::dummy_candidate_receipt;
 use sp_core::H256;
+
+const VALIDATION_CODE_BOMB_LIMIT: u32 = 30 * 1024 * 1024;
 
 use std::{io::Write, sync::Arc, time::Duration};
 use tokio::sync::Mutex;
@@ -92,6 +99,7 @@ impl TestHost {
 					executor_params,
 					TEST_PREPARATION_TIMEOUT,
 					PrepareJobKind::Prechecking,
+					VALIDATION_CODE_BOMB_LIMIT,
 				),
 				result_tx,
 			)
@@ -106,8 +114,20 @@ impl TestHost {
 		pvd: PersistedValidationData,
 		pov: PoV,
 		executor_params: ExecutorParams,
+		relay_parent: Hash,
 	) -> Result<ValidationResult, ValidationError> {
 		let (result_tx, result_rx) = futures::channel::oneshot::channel();
+
+		let candidate_receipt: polkadot_primitives::CandidateReceiptV2 =
+			dummy_candidate_receipt(relay_parent).into();
+		let validation_context = ValidationContext {
+			candidate_receipt,
+			pvd: Arc::new(pvd),
+			pov: Arc::new(pov),
+			executor_params: executor_params.clone(),
+			exec_timeout: TEST_EXECUTION_TIMEOUT,
+			v3_seen: false,
+		};
 
 		self.host
 			.lock()
@@ -118,16 +138,29 @@ impl TestHost {
 					executor_params,
 					TEST_PREPARATION_TIMEOUT,
 					PrepareJobKind::Compilation,
+					VALIDATION_CODE_BOMB_LIMIT,
 				),
-				TEST_EXECUTION_TIMEOUT,
-				Arc::new(pvd),
-				Arc::new(pov),
+				validation_context,
 				polkadot_node_core_pvf::Priority::Normal,
+				PvfExecKind::Backing(relay_parent),
 				result_tx,
 			)
 			.await
 			.unwrap();
 		result_rx.await.unwrap()
+	}
+
+	async fn replace_artifact_checksum(
+		&self,
+		checksum: ArtifactChecksum,
+		new_checksum: ArtifactChecksum,
+	) {
+		self.host
+			.lock()
+			.await
+			.replace_artifact_checksum(checksum, new_checksum)
+			.await
+			.unwrap();
 	}
 
 	#[cfg(all(feature = "ci-only-tests", target_os = "linux"))]
@@ -168,7 +201,13 @@ async fn execute_job_terminates_on_timeout() {
 
 	let start = std::time::Instant::now();
 	let result = host
-		.validate_candidate(test_parachain_halt::wasm_binary_unwrap(), pvd, pov, Default::default())
+		.validate_candidate(
+			test_parachain_halt::wasm_binary_unwrap(),
+			pvd,
+			pov,
+			Default::default(),
+			H256::default(),
+		)
 		.await;
 
 	match result {
@@ -198,12 +237,14 @@ async fn ensure_parallel_execution() {
 		pvd.clone(),
 		pov.clone(),
 		Default::default(),
+		H256::default(),
 	);
 	let execute_pvf_future_2 = host.validate_candidate(
 		test_parachain_halt::wasm_binary_unwrap(),
 		pvd,
 		pov,
 		Default::default(),
+		H256::default(),
 	);
 
 	let start = std::time::Instant::now();
@@ -251,6 +292,7 @@ async fn execute_queue_doesnt_stall_if_workers_died() {
 			pvd.clone(),
 			pov.clone(),
 			Default::default(),
+			H256::default(),
 		)
 	}))
 	.await;
@@ -300,6 +342,7 @@ async fn execute_queue_doesnt_stall_with_varying_executor_params() {
 				0 => executor_params_1.clone(),
 				_ => executor_params_2.clone(),
 			},
+			H256::default(),
 		)
 	}))
 	.await;
@@ -356,15 +399,22 @@ async fn deleting_prepared_artifact_does_not_dispute() {
 
 	// Try to validate, artifact should get recreated.
 	let result = host
-		.validate_candidate(test_parachain_halt::wasm_binary_unwrap(), pvd, pov, Default::default())
+		.validate_candidate(
+			test_parachain_halt::wasm_binary_unwrap(),
+			pvd,
+			pov,
+			Default::default(),
+			H256::default(),
+		)
 		.await;
 
 	assert_matches!(result, Err(ValidationError::Invalid(InvalidCandidate::HardTimeout)));
 }
 
-// Test that corruption of a prepared artifact does not lead to a dispute when we try to execute it.
+// Test that corruption of a prepared artifact due to disk issues does not lead to a dispute when we
+// try to execute it.
 #[tokio::test]
-async fn corrupted_prepared_artifact_does_not_dispute() {
+async fn corrupted_on_disk_prepared_artifact_does_not_dispute() {
 	let host = TestHost::new().await;
 	let cache_dir = host.cache_dir.path();
 	let pvd = PersistedValidationData {
@@ -407,7 +457,102 @@ async fn corrupted_prepared_artifact_does_not_dispute() {
 
 	// Try to validate, artifact should get removed because of the corruption.
 	let result = host
-		.validate_candidate(test_parachain_halt::wasm_binary_unwrap(), pvd, pov, Default::default())
+		.validate_candidate(
+			test_parachain_halt::wasm_binary_unwrap(),
+			pvd,
+			pov,
+			Default::default(),
+			H256::default(),
+		)
+		.await;
+
+	assert_matches!(
+		result,
+		Err(ValidationError::PossiblyInvalid(PossiblyInvalidError::CorruptedArtifact))
+	);
+
+	// because of CorruptedArtifact we may retry
+	host.precheck_pvf(test_parachain_halt::wasm_binary_unwrap(), Default::default())
+		.await
+		.unwrap();
+
+	// The actual artifact removal is done concurrently
+	// with sending of the result of the execution
+	// it is not a problem for further re-preparation as
+	// artifact filenames are random
+	for _ in 1..5 {
+		if !artifact_path.path().exists() {
+			break;
+		}
+		tokio::time::sleep(Duration::from_secs(1)).await;
+	}
+
+	assert!(
+		!artifact_path.path().exists(),
+		"the corrupted artifact ({}) should be deleted by the host",
+		artifact_path.path().display()
+	);
+}
+
+// Test that corruption of a prepared artifact does not lead to a dispute when we try to execute it.
+#[tokio::test]
+async fn corrupted_prepared_artifact_does_not_dispute() {
+	let host = TestHost::new().await;
+	let cache_dir = host.cache_dir.path();
+	let pvd = PersistedValidationData {
+		parent_head: Default::default(),
+		relay_parent_number: 1u32,
+		relay_parent_storage_root: H256::default(),
+		max_pov_size: 4096 * 1024,
+	};
+	let pov = PoV { block_data: BlockData(Vec::new()) };
+
+	let _stats = host
+		.precheck_pvf(test_parachain_halt::wasm_binary_unwrap(), Default::default())
+		.await
+		.unwrap();
+
+	// Manually corrupting the prepared artifact from disk. The in-memory artifacts table won't
+	// change.
+	let (artifact_path, checksum, new_checksum) = {
+		// Get the artifact path (asserting it exists).
+		let mut cache_dir: Vec<_> = std::fs::read_dir(cache_dir).unwrap().collect();
+		// Should contain the artifact and the worker dir.
+		assert_eq!(cache_dir.len(), 2);
+		let mut artifact_path = cache_dir.pop().unwrap().unwrap();
+		if artifact_path.path().is_dir() {
+			artifact_path = cache_dir.pop().unwrap().unwrap();
+		}
+
+		let checksum =
+			compute_checksum(&std::fs::read(artifact_path.path()).expect("artifact exists"));
+		let new_artifact = b"corrupted wasm";
+		let new_checksum = compute_checksum(new_artifact);
+
+		// Corrupt the artifact.
+		let mut f = std::fs::OpenOptions::new()
+			.write(true)
+			.truncate(true)
+			.open(artifact_path.path())
+			.unwrap();
+		f.write_all(new_artifact).unwrap();
+		f.flush().unwrap();
+		(artifact_path, checksum, new_checksum)
+	};
+
+	assert!(artifact_path.path().exists());
+
+	host.replace_artifact_checksum(checksum, new_checksum).await;
+
+	// Try to validate, artifact should get removed because of the corruption.
+	let result = host
+		.validate_candidate(
+			test_parachain_halt::wasm_binary_unwrap(),
+			pvd,
+			pov,
+			Default::default(),
+			H256::default(),
+		)
 		.await;
 
 	assert_matches!(
@@ -580,8 +725,9 @@ async fn artifact_does_not_reprepare_on_non_meaningful_exec_parameter_change() {
 	let cache_dir = host.cache_dir.path();
 
 	let set1 = ExecutorParams::default();
-	let set2 =
-		ExecutorParams::from(&[ExecutorParam::PvfExecTimeout(PvfExecKind::Backing, 2500)][..]);
+	let set2 = ExecutorParams::from(
+		&[ExecutorParam::PvfExecTimeout(RuntimePvfExecKind::Backing, 2500)][..],
+	);
 
 	let _stats = host
 		.precheck_pvf(test_parachain_halt::wasm_binary_unwrap(), set1)
@@ -631,8 +777,7 @@ async fn artifact_does_reprepare_on_meaningful_exec_parameter_change() {
 	let cache_dir = host.cache_dir.path();
 
 	let set1 = ExecutorParams::default();
-	let set2 =
-		ExecutorParams::from(&[ExecutorParam::PvfPrepTimeout(PvfPrepKind::Prepare, 60000)][..]);
+	let set2 = ExecutorParams::from(&[ExecutorParam::StackLogicalMax(1024)][..]);
 
 	let _stats = host
 		.precheck_pvf(test_parachain_halt::wasm_binary_unwrap(), set1)
@@ -655,9 +800,12 @@ async fn artifact_does_reprepare_on_meaningful_exec_parameter_change() {
 #[tokio::test]
 async fn invalid_compressed_code_fails_prechecking() {
 	let host = TestHost::new().await;
-	let raw_code = vec![2u8; VALIDATION_CODE_BOMB_LIMIT + 1];
-	let validation_code =
-		sp_maybe_compressed_blob::compress(&raw_code, VALIDATION_CODE_BOMB_LIMIT + 1).unwrap();
+	let raw_code = vec![2u8; VALIDATION_CODE_BOMB_LIMIT as usize + 1];
+	let validation_code = sp_maybe_compressed_blob::compress_strongly(
+		&raw_code,
+		VALIDATION_CODE_BOMB_LIMIT as usize + 1,
+	)
+	.unwrap();
 
 	let res = host.precheck_pvf(&validation_code, Default::default()).await;
 
@@ -676,11 +824,16 @@ async fn invalid_compressed_code_fails_validation() {
 	};
 	let pov = PoV { block_data: BlockData(Vec::new()) };
 
-	let raw_code = vec![2u8; VALIDATION_CODE_BOMB_LIMIT + 1];
-	let validation_code =
-		sp_maybe_compressed_blob::compress(&raw_code, VALIDATION_CODE_BOMB_LIMIT + 1).unwrap();
+	let raw_code = vec![2u8; VALIDATION_CODE_BOMB_LIMIT as usize + 1];
+	let validation_code = sp_maybe_compressed_blob::compress_strongly(
+		&raw_code,
+		VALIDATION_CODE_BOMB_LIMIT as usize + 1,
+	)
+	.unwrap();
 
-	let result = host.validate_candidate(&validation_code, pvd, pov, Default::default()).await;
+	let result = host
+		.validate_candidate(&validation_code, pvd, pov, Default::default(), H256::default())
+		.await;
 
 	assert_matches!(
 		result,
@@ -700,11 +853,17 @@ async fn invalid_compressed_pov_fails_validation() {
 	};
 	let raw_block_data = vec![1u8; POV_BOMB_LIMIT + 1];
 	let block_data =
-		sp_maybe_compressed_blob::compress(&raw_block_data, POV_BOMB_LIMIT + 1).unwrap();
+		sp_maybe_compressed_blob::compress_weakly(&raw_block_data, POV_BOMB_LIMIT + 1).unwrap();
 	let pov = PoV { block_data: BlockData(block_data) };
 
 	let result = host
-		.validate_candidate(test_parachain_halt::wasm_binary_unwrap(), pvd, pov, Default::default())
+		.validate_candidate(
+			test_parachain_halt::wasm_binary_unwrap(),
+			pvd,
+			pov,
+			Default::default(),
+			H256::default(),
+		)
 		.await;
 
 	assert_matches!(

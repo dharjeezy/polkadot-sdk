@@ -17,17 +17,20 @@
 use super::*;
 use assert_matches::assert_matches;
 use polkadot_node_subsystem::{
-	errors::RuntimeApiError,
 	messages::{
 		AllMessages, HypotheticalMembershipRequest, ParentHeadData, ProspectiveParachainsMessage,
 		ProspectiveValidationDataRequest,
 	},
+	RuntimeApiError,
 };
 use polkadot_node_subsystem_test_helpers as test_helpers;
 use polkadot_primitives::{
-	async_backing::{AsyncBackingParams, BackingState, Constraints, InboundHrmpLimitations},
-	CommittedCandidateReceipt, CoreIndex, HeadData, Header, PersistedValidationData, ScheduledCore,
-	ValidationCodeHash,
+	async_backing::{
+		BackingState, CandidatePendingAvailability, Constraints, InboundHrmpLimitations,
+	},
+	BlockNumber, CommittedCandidateReceiptV2 as CommittedCandidateReceipt, CoreIndex, HeadData,
+	Header, MutateDescriptorV2, PersistedValidationData, ValidationCodeHash,
+	DEFAULT_SCHEDULING_LOOKAHEAD,
 };
 use polkadot_primitives_test_helpers::make_candidate;
 use rstest::rstest;
@@ -37,11 +40,7 @@ use std::{
 };
 use test_helpers::mock::new_leaf;
 
-const ALLOWED_ANCESTRY_LEN: u32 = 3;
-const ASYNC_BACKING_PARAMETERS: AsyncBackingParams =
-	AsyncBackingParams { max_candidate_depth: 4, allowed_ancestry_len: ALLOWED_ANCESTRY_LEN };
-
-const ASYNC_BACKING_DISABLED_ERROR: RuntimeApiError =
+const RUNTIME_API_NOT_SUPPORTED: RuntimeApiError =
 	RuntimeApiError::NotSupported { runtime_api_name: "test-runtime" };
 
 const MAX_POV_SIZE: u32 = 1_000_000;
@@ -58,6 +57,7 @@ fn dummy_constraints(
 	Constraints {
 		min_relay_parent_number,
 		max_pov_size: MAX_POV_SIZE,
+		max_head_data_size: 20480,
 		max_code_size: 1_000_000,
 		ump_remaining: 10,
 		ump_remaining_bytes: 1_000,
@@ -85,15 +85,21 @@ impl Default for TestState {
 		let chain_b = ParaId::from(2);
 
 		let mut claim_queue = BTreeMap::new();
-		claim_queue.insert(CoreIndex(0), [chain_a].into_iter().collect());
-		claim_queue.insert(CoreIndex(1), [chain_b].into_iter().collect());
+		claim_queue.insert(
+			CoreIndex(0),
+			std::iter::repeat(chain_a).take(DEFAULT_SCHEDULING_LOOKAHEAD as _).collect(),
+		);
+		claim_queue.insert(
+			CoreIndex(1),
+			std::iter::repeat(chain_b).take(DEFAULT_SCHEDULING_LOOKAHEAD as _).collect(),
+		);
 
 		let validation_code_hash = Hash::repeat_byte(42).into();
 
 		Self {
 			validation_code_hash,
 			claim_queue,
-			runtime_api_version: RuntimeApiRequest::CLAIM_QUEUE_RUNTIME_REQUIREMENT,
+			runtime_api_version: RuntimeApiRequest::CONSTRAINTS_RUNTIME_REQUIREMENT,
 		}
 	}
 }
@@ -144,22 +150,20 @@ fn test_harness<T: Future<Output = VirtualOverseer>>(
 
 #[derive(Debug, Clone)]
 struct PerParaData {
-	min_relay_parent: BlockNumber,
 	head_data: HeadData,
 	pending_availability: Vec<CandidatePendingAvailability>,
 }
 
 impl PerParaData {
-	pub fn new(min_relay_parent: BlockNumber, head_data: HeadData) -> Self {
-		Self { min_relay_parent, head_data, pending_availability: Vec::new() }
+	pub fn new(head_data: HeadData) -> Self {
+		Self { head_data, pending_availability: Vec::new() }
 	}
 
 	pub fn new_with_pending(
-		min_relay_parent: BlockNumber,
 		head_data: HeadData,
 		pending: Vec<CandidatePendingAvailability>,
 	) -> Self {
-		Self { min_relay_parent, head_data, pending_availability: pending }
+		Self { head_data, pending_availability: pending }
 	}
 }
 
@@ -202,7 +206,17 @@ async fn activate_leaf(
 	leaf: &TestLeaf,
 	test_state: &TestState,
 ) {
-	activate_leaf_with_params(virtual_overseer, leaf, test_state, ASYNC_BACKING_PARAMETERS).await;
+	let TestLeaf { number, hash, .. } = leaf;
+
+	let activated = new_leaf(*hash, *number);
+
+	virtual_overseer
+		.send(FromOrchestra::Signal(OverseerSignal::ActiveLeaves(ActiveLeavesUpdate::start_work(
+			activated,
+		))))
+		.await;
+
+	handle_leaf_activation(virtual_overseer, leaf, test_state, get_parent_hash).await;
 }
 
 async fn activate_leaf_with_parent_hash_fn(
@@ -221,124 +235,64 @@ async fn activate_leaf_with_parent_hash_fn(
 		))))
 		.await;
 
-	handle_leaf_activation(
-		virtual_overseer,
-		leaf,
-		test_state,
-		ASYNC_BACKING_PARAMETERS,
-		parent_hash_fn,
-	)
-	.await;
-}
-
-async fn activate_leaf_with_params(
-	virtual_overseer: &mut VirtualOverseer,
-	leaf: &TestLeaf,
-	test_state: &TestState,
-	async_backing_params: AsyncBackingParams,
-) {
-	let TestLeaf { number, hash, .. } = leaf;
-
-	let activated = new_leaf(*hash, *number);
-
-	virtual_overseer
-		.send(FromOrchestra::Signal(OverseerSignal::ActiveLeaves(ActiveLeavesUpdate::start_work(
-			activated,
-		))))
-		.await;
-
-	handle_leaf_activation(
-		virtual_overseer,
-		leaf,
-		test_state,
-		async_backing_params,
-		get_parent_hash,
-	)
-	.await;
+	handle_leaf_activation(virtual_overseer, leaf, test_state, parent_hash_fn).await;
 }
 
 async fn handle_leaf_activation(
 	virtual_overseer: &mut VirtualOverseer,
 	leaf: &TestLeaf,
 	test_state: &TestState,
-	async_backing_params: AsyncBackingParams,
 	parent_hash_fn: impl Fn(Hash) -> Hash,
 ) {
-	let TestLeaf { number, hash, para_data } = leaf;
+	let TestLeaf { number, hash, para_data: _ } = leaf;
 
 	assert_matches!(
 		virtual_overseer.recv().await,
 		AllMessages::RuntimeApi(
-			RuntimeApiMessage::Request(parent, RuntimeApiRequest::AsyncBackingParams(tx))
+			RuntimeApiMessage::Request(parent, RuntimeApiRequest::ClaimQueue(tx))
 		) if parent == *hash => {
-			tx.send(Ok(async_backing_params)).unwrap();
+			tx.send(Ok(test_state.claim_queue.clone())).unwrap();
 		}
 	);
-
-	assert_matches!(
-		virtual_overseer.recv().await,
-		AllMessages::RuntimeApi(
-			RuntimeApiMessage::Request(parent, RuntimeApiRequest::Version(tx))
-		) if parent == *hash => {
-			tx.send(
-				Ok(test_state.runtime_api_version)
-			).unwrap();
-		}
-	);
-
-	if test_state.runtime_api_version < RuntimeApiRequest::CLAIM_QUEUE_RUNTIME_REQUIREMENT {
-		assert_matches!(
-			virtual_overseer.recv().await,
-			AllMessages::RuntimeApi(
-				RuntimeApiMessage::Request(parent, RuntimeApiRequest::AvailabilityCores(tx))
-			) if parent == *hash => {
-				tx.send(Ok(test_state.claim_queue.values().map(|paras| CoreState::Scheduled(
-					ScheduledCore {
-						para_id: *paras.front().unwrap(),
-						collator: None
-					}
-				)).collect())).unwrap();
-			}
-		);
-	} else {
-		assert_matches!(
-			virtual_overseer.recv().await,
-			AllMessages::RuntimeApi(
-				RuntimeApiMessage::Request(parent, RuntimeApiRequest::ClaimQueue(tx))
-			) if parent == *hash => {
-				tx.send(Ok(test_state.claim_queue.clone())).unwrap();
-			}
-		);
-	}
 
 	send_block_header(virtual_overseer, *hash, *number).await;
 
+	assert_matches!(
+		virtual_overseer.recv().await,
+		AllMessages::RuntimeApi(
+			RuntimeApiMessage::Request(parent, RuntimeApiRequest::SessionIndexForChild(tx))
+		) if parent == *hash => {
+			tx.send(Ok(1)).unwrap();
+		}
+	);
+
+	assert_matches!(
+		virtual_overseer.recv().await,
+		AllMessages::RuntimeApi(
+			RuntimeApiMessage::Request(parent, RuntimeApiRequest::SchedulingLookahead(session_index, tx))
+		) if parent == *hash && session_index == 1 => {
+			tx.send(Ok(DEFAULT_SCHEDULING_LOOKAHEAD)).unwrap();
+		}
+	);
+
 	// Check that subsystem job issues a request for ancestors.
-	let min_min = para_data.iter().map(|(_, data)| data.min_relay_parent).min().unwrap_or(*number);
-	let ancestry_len = number - min_min;
+	// ancestry_len is (lookahead - 1), which determines how many ancestors to fetch.
+	let ancestry_len = (DEFAULT_SCHEDULING_LOOKAHEAD - 1) as usize;
 	let ancestry_hashes: Vec<Hash> =
 		std::iter::successors(Some(*hash), |h| Some(parent_hash_fn(*h)))
 			.skip(1)
-			.take(ancestry_len as usize)
+			.take(ancestry_len)
 			.collect();
-	let ancestry_numbers = (min_min..*number).rev();
+	let min_relay_parent_number = number.saturating_sub(ancestry_len as u32);
+	let ancestry_numbers = (min_relay_parent_number..*number).rev();
 	let ancestry_iter = ancestry_hashes.clone().into_iter().zip(ancestry_numbers).peekable();
 	if ancestry_len > 0 {
 		assert_matches!(
 			virtual_overseer.recv().await,
 			AllMessages::ChainApi(
 				ChainApiMessage::Ancestors{hash: block_hash, k, response_channel: tx}
-			) if block_hash == *hash && k == ALLOWED_ANCESTRY_LEN as usize => {
+			) if block_hash == *hash && k == (DEFAULT_SCHEDULING_LOOKAHEAD - 1) as usize => {
 				tx.send(Ok(ancestry_hashes.clone())).unwrap();
-			}
-		);
-
-		assert_matches!(
-			virtual_overseer.recv().await,
-			AllMessages::RuntimeApi(
-				RuntimeApiMessage::Request(parent, RuntimeApiRequest::SessionIndexForChild(tx))
-			) if parent == *hash => {
-				tx.send(Ok(1)).unwrap();
 			}
 		);
 	}
@@ -361,65 +315,105 @@ async fn handle_leaf_activation(
 
 	let paras: HashSet<_> = test_state.claim_queue.values().flatten().collect();
 
-	for _ in 0..paras.len() {
+	// We expect two messages per parachain block.
+	for _ in 0..paras.len() * 2 {
 		let message = virtual_overseer.recv().await;
-		// Get the para we are working with since the order is not deterministic.
-		let para_id = match &message {
+		let para_id = match message {
 			AllMessages::RuntimeApi(RuntimeApiMessage::Request(
-				_,
-				RuntimeApiRequest::ParaBackingState(p_id, _),
-			)) => *p_id,
+				parent,
+				RuntimeApiRequest::ParaBackingState(p_id, tx),
+			)) if parent == *hash => {
+				let PerParaData { head_data, pending_availability } = leaf.para_data(p_id);
+
+				// Calculate global min_relay_parent_number
+				let min_relay_parent_number =
+					number.saturating_sub((DEFAULT_SCHEDULING_LOOKAHEAD - 1) as u32);
+
+				let constraints = dummy_constraints(
+					min_relay_parent_number,
+					vec![*number],
+					head_data.clone(),
+					test_state.validation_code_hash,
+				);
+
+				tx.send(Ok(Some(BackingState {
+					constraints,
+					pending_availability: pending_availability.clone(),
+				})))
+				.unwrap();
+				Some(p_id)
+			},
+			AllMessages::RuntimeApi(RuntimeApiMessage::Request(
+				parent,
+				RuntimeApiRequest::BackingConstraints(p_id, tx),
+			)) if parent == *hash &&
+				test_state.runtime_api_version >=
+					RuntimeApiRequest::CONSTRAINTS_RUNTIME_REQUIREMENT =>
+			{
+				let PerParaData { head_data, pending_availability: _ } = leaf.para_data(p_id);
+
+				// min_relay_parent_number is global (same for all paras), calculated as:
+				// now - min(lookahead - 1, actual_ancestry_len)
+				// The ancestry_len was calculated during leaf activation and determines
+				// how many ancestors are available (limited by session boundaries).
+				let min_relay_parent_number = number.saturating_sub(ancestry_len as u32);
+
+				let constraints = dummy_constraints(
+					min_relay_parent_number,
+					vec![*number],
+					head_data.clone(),
+					test_state.validation_code_hash,
+				);
+
+				tx.send(Ok(Some(constraints))).unwrap();
+				None
+			},
+			AllMessages::RuntimeApi(RuntimeApiMessage::Request(
+				parent,
+				RuntimeApiRequest::BackingConstraints(_p_id, tx),
+			)) if parent == *hash &&
+				test_state.runtime_api_version <
+					RuntimeApiRequest::CONSTRAINTS_RUNTIME_REQUIREMENT =>
+			{
+				tx.send(Err(RUNTIME_API_NOT_SUPPORTED)).unwrap();
+				None
+			},
+
+			AllMessages::RuntimeApi(RuntimeApiMessage::Request(
+				parent,
+				RuntimeApiRequest::CandidatesPendingAvailability(p_id, tx),
+			)) if parent == *hash => {
+				tx.send(Ok(leaf
+					.para_data(p_id)
+					.pending_availability
+					.clone()
+					.into_iter()
+					.map(|c| CommittedCandidateReceipt {
+						descriptor: c.descriptor,
+						commitments: c.commitments,
+					})
+					.collect()))
+					.unwrap();
+				Some(p_id)
+			},
 			_ => panic!("received unexpected message {:?}", message),
 		};
 
-		let PerParaData { min_relay_parent, head_data, pending_availability } =
-			leaf.para_data(para_id);
-		let constraints = dummy_constraints(
-			*min_relay_parent,
-			vec![*number],
-			head_data.clone(),
-			test_state.validation_code_hash,
-		);
-		let backing_state =
-			BackingState { constraints, pending_availability: pending_availability.clone() };
+		if let Some(para_id) = para_id {
+			for pending in leaf.para_data(para_id).pending_availability.clone() {
+				if !used_relay_parents.contains(&pending.descriptor.relay_parent()) {
+					send_block_header(
+						virtual_overseer,
+						pending.descriptor.relay_parent(),
+						pending.relay_parent_number,
+					)
+					.await;
 
-		assert_matches!(
-			message,
-			AllMessages::RuntimeApi(
-				RuntimeApiMessage::Request(parent, RuntimeApiRequest::ParaBackingState(p_id, tx))
-			) if parent == *hash && p_id == para_id => {
-				tx.send(Ok(Some(backing_state))).unwrap();
-			}
-		);
-
-		for pending in pending_availability {
-			if !used_relay_parents.contains(&pending.descriptor.relay_parent) {
-				send_block_header(
-					virtual_overseer,
-					pending.descriptor.relay_parent,
-					pending.relay_parent_number,
-				)
-				.await;
-
-				used_relay_parents.insert(pending.descriptor.relay_parent);
+					used_relay_parents.insert(pending.descriptor.relay_parent());
+				}
 			}
 		}
 	}
-
-	// Get minimum relay parents.
-	let (tx, rx) = oneshot::channel();
-	virtual_overseer
-		.send(overseer::FromOrchestra::Communication {
-			msg: ProspectiveParachainsMessage::GetMinimumRelayParents(*hash, tx),
-		})
-		.await;
-	let mut resp = rx.await.unwrap();
-	resp.sort();
-	let mrp_response: Vec<(ParaId, BlockNumber)> = para_data
-		.iter()
-		.map(|(para_id, data)| (*para_id, data.min_relay_parent))
-		.collect();
-	assert_eq!(resp, mrp_response);
 }
 
 async fn deactivate_leaf(virtual_overseer: &mut VirtualOverseer, hash: Hash) {
@@ -436,7 +430,7 @@ async fn introduce_seconded_candidate(
 	pvd: PersistedValidationData,
 ) {
 	let req = IntroduceSecondedCandidateRequest {
-		candidate_para: candidate.descriptor().para_id,
+		candidate_para: candidate.descriptor.para_id(),
 		candidate_receipt: candidate,
 		persisted_validation_data: pvd,
 	};
@@ -455,7 +449,7 @@ async fn introduce_seconded_candidate_failed(
 	pvd: PersistedValidationData,
 ) {
 	let req = IntroduceSecondedCandidateRequest {
-		candidate_para: candidate.descriptor().para_id,
+		candidate_para: candidate.descriptor.para_id(),
 		candidate_receipt: candidate,
 		persisted_validation_data: pvd,
 	};
@@ -476,7 +470,7 @@ async fn back_candidate(
 	virtual_overseer
 		.send(overseer::FromOrchestra::Communication {
 			msg: ProspectiveParachainsMessage::CandidateBacked(
-				candidate.descriptor.para_id,
+				candidate.descriptor.para_id(),
 				candidate_hash,
 			),
 		})
@@ -489,14 +483,18 @@ async fn get_backable_candidates(
 	para_id: ParaId,
 	ancestors: Ancestors,
 	count: u32,
-	expected_result: Vec<(CandidateHash, Hash)>,
+	expected_result: Vec<BackableCandidateRef>,
 ) {
 	let (tx, rx) = oneshot::channel();
 	virtual_overseer
 		.send(overseer::FromOrchestra::Communication {
-			msg: ProspectiveParachainsMessage::GetBackableCandidates(
-				leaf.hash, para_id, count, ancestors, tx,
-			),
+			msg: ProspectiveParachainsMessage::GetBackableCandidates {
+				leaf: leaf.hash,
+				para_id,
+				count,
+				ancestors,
+				sender: tx,
+			},
 		})
 		.await;
 	let resp = rx.await.unwrap();
@@ -568,7 +566,7 @@ macro_rules! make_and_back_candidate {
 			$test_state.validation_code_hash,
 		);
 		// Set a field to make this candidate unique.
-		candidate.descriptor.para_head = Hash::from_low_u64_le($index);
+		candidate.descriptor.set_para_head(Hash::from_low_u64_le($index));
 		let candidate_hash = candidate.hash();
 		introduce_seconded_candidate(&mut $virtual_overseer, candidate.clone(), pvd).await;
 		back_candidate(&mut $virtual_overseer, &candidate, candidate_hash).await;
@@ -577,45 +575,17 @@ macro_rules! make_and_back_candidate {
 	}};
 }
 
-#[test]
-fn should_do_no_work_if_async_backing_disabled_for_leaf() {
-	async fn activate_leaf_async_backing_disabled(virtual_overseer: &mut VirtualOverseer) {
-		let hash = Hash::from_low_u64_be(130);
-
-		// Start work on some new parent.
-		virtual_overseer
-			.send(FromOrchestra::Signal(OverseerSignal::ActiveLeaves(
-				ActiveLeavesUpdate::start_work(new_leaf(hash, 1)),
-			)))
-			.await;
-
-		assert_matches!(
-			virtual_overseer.recv().await,
-			AllMessages::RuntimeApi(
-				RuntimeApiMessage::Request(parent, RuntimeApiRequest::AsyncBackingParams(tx))
-			) if parent == hash => {
-				tx.send(Err(ASYNC_BACKING_DISABLED_ERROR)).unwrap();
-			}
-		);
-	}
-
-	let view = test_harness(|mut virtual_overseer| async move {
-		activate_leaf_async_backing_disabled(&mut virtual_overseer).await;
-
-		virtual_overseer
-	});
-
-	assert!(view.active_leaves.is_empty());
-}
-
 // Send some candidates and make sure all are found:
 // - Two for the same leaf A (one for parachain 1 and one for parachain 2)
 // - One for leaf B on parachain 1
 // - One for leaf C on parachain 2
 // Also tests a claim queue size larger than 1.
-#[test]
-fn introduce_candidates_basic() {
+#[rstest]
+#[case(RuntimeApiRequest::CONSTRAINTS_RUNTIME_REQUIREMENT)]
+#[case(RuntimeApiRequest::CLAIM_QUEUE_RUNTIME_REQUIREMENT)]
+fn introduce_candidates_basic(#[case] runtime_api_version: u32) {
 	let mut test_state = TestState::default();
+	test_state.set_runtime_api_version(runtime_api_version);
 
 	let chain_a = ParaId::from(1);
 	let chain_b = ParaId::from(2);
@@ -630,8 +600,8 @@ fn introduce_candidates_basic() {
 			number: 100,
 			hash: Hash::from_low_u64_be(130),
 			para_data: vec![
-				(1.into(), PerParaData::new(97, HeadData(vec![1, 2, 3]))),
-				(2.into(), PerParaData::new(100, HeadData(vec![2, 3, 4]))),
+				(1.into(), PerParaData::new(HeadData(vec![1, 2, 3]))),
+				(2.into(), PerParaData::new(HeadData(vec![2, 3, 4]))),
 			],
 		};
 		// Leaf B
@@ -639,8 +609,8 @@ fn introduce_candidates_basic() {
 			number: 101,
 			hash: Hash::from_low_u64_be(131),
 			para_data: vec![
-				(1.into(), PerParaData::new(99, HeadData(vec![3, 4, 5]))),
-				(2.into(), PerParaData::new(101, HeadData(vec![4, 5, 6]))),
+				(1.into(), PerParaData::new(HeadData(vec![3, 4, 5]))),
+				(2.into(), PerParaData::new(HeadData(vec![4, 5, 6]))),
 			],
 		};
 		// Leaf C
@@ -648,8 +618,8 @@ fn introduce_candidates_basic() {
 			number: 102,
 			hash: Hash::from_low_u64_be(132),
 			para_data: vec![
-				(1.into(), PerParaData::new(102, HeadData(vec![5, 6, 7]))),
-				(2.into(), PerParaData::new(98, HeadData(vec![6, 7, 8]))),
+				(1.into(), PerParaData::new(HeadData(vec![5, 6, 7]))),
+				(2.into(), PerParaData::new(HeadData(vec![6, 7, 8]))),
 			],
 		};
 
@@ -668,7 +638,10 @@ fn introduce_candidates_basic() {
 			test_state.validation_code_hash,
 		);
 		let candidate_hash_a1 = candidate_a1.hash();
-		let response_a1 = vec![(candidate_hash_a1, leaf_a.hash)];
+		let response_a1 = vec![BackableCandidateRef {
+			candidate_hash: candidate_hash_a1,
+			scheduling_parent: leaf_a.hash,
+		}];
 
 		// Candidate A2
 		let (candidate_a2, pvd_a2) = make_candidate(
@@ -680,7 +653,10 @@ fn introduce_candidates_basic() {
 			test_state.validation_code_hash,
 		);
 		let candidate_hash_a2 = candidate_a2.hash();
-		let response_a2 = vec![(candidate_hash_a2, leaf_a.hash)];
+		let response_a2 = vec![BackableCandidateRef {
+			candidate_hash: candidate_hash_a2,
+			scheduling_parent: leaf_a.hash,
+		}];
 
 		// Candidate B
 		let (candidate_b, pvd_b) = make_candidate(
@@ -692,7 +668,10 @@ fn introduce_candidates_basic() {
 			test_state.validation_code_hash,
 		);
 		let candidate_hash_b = candidate_b.hash();
-		let response_b = vec![(candidate_hash_b, leaf_b.hash)];
+		let response_b = vec![BackableCandidateRef {
+			candidate_hash: candidate_hash_b,
+			scheduling_parent: leaf_b.hash,
+		}];
 
 		// Candidate C
 		let (candidate_c, pvd_c) = make_candidate(
@@ -704,7 +683,10 @@ fn introduce_candidates_basic() {
 			test_state.validation_code_hash,
 		);
 		let candidate_hash_c = candidate_c.hash();
-		let response_c = vec![(candidate_hash_c, leaf_c.hash)];
+		let response_c = vec![BackableCandidateRef {
+			candidate_hash: candidate_hash_c,
+			scheduling_parent: leaf_c.hash,
+		}];
 
 		// Introduce candidates.
 		introduce_seconded_candidate(&mut virtual_overseer, candidate_a1.clone(), pvd_a1).await;
@@ -783,17 +765,144 @@ fn introduce_candidates_basic() {
 	assert_eq!(view.active_leaves.len(), 3);
 }
 
-#[test]
-fn introduce_candidate_multiple_times() {
-	let test_state = TestState::default();
+// Check if candidates are not backed if they fail constraint checks
+#[rstest]
+#[case(RuntimeApiRequest::CONSTRAINTS_RUNTIME_REQUIREMENT)]
+#[case(RuntimeApiRequest::CLAIM_QUEUE_RUNTIME_REQUIREMENT)]
+fn introduce_candidates_error(#[case] runtime_api_version: u32) {
+	let mut test_state = TestState::default();
+	test_state.set_runtime_api_version(runtime_api_version);
+	test_state.claim_queue.insert(
+		CoreIndex(2),
+		std::iter::repeat(1.into()).take(DEFAULT_SCHEDULING_LOOKAHEAD as _).collect(),
+	);
+
+	let view = test_harness(|mut virtual_overseer| async move {
+		// Leaf A
+		let leaf_a = TestLeaf {
+			number: 100,
+			hash: Default::default(),
+			para_data: vec![
+				(1.into(), PerParaData::new(HeadData(vec![1, 2, 3]))),
+				(2.into(), PerParaData::new(HeadData(vec![2, 3, 4]))),
+			],
+		};
+
+		// Activate leaves.
+		activate_leaf(&mut virtual_overseer, &leaf_a, &test_state).await;
+
+		// Candidate A.
+		let (candidate_a, pvd_a) = make_candidate(
+			leaf_a.hash,
+			leaf_a.number,
+			1.into(),
+			HeadData(vec![1, 2, 3]),
+			HeadData(vec![1]),
+			test_state.validation_code_hash,
+		);
+
+		// Candidate B.
+		let (candidate_b, pvd_b) = make_candidate(
+			leaf_a.hash,
+			leaf_a.number,
+			1.into(),
+			HeadData(vec![1]),
+			HeadData(vec![1; 20480]),
+			test_state.validation_code_hash,
+		);
+
+		// Candidate C commits to oversized head data.
+		let (candidate_c, pvd_c) = make_candidate(
+			leaf_a.hash,
+			leaf_a.number,
+			1.into(),
+			HeadData(vec![1; 20480]),
+			HeadData(vec![0; 20485]),
+			test_state.validation_code_hash,
+		);
+
+		// Get hypothetical membership of candidates before adding candidate A.
+		// Candidate A can be added directly, candidates B and C are potential candidates.
+		for (candidate, pvd) in
+			[(candidate_a.clone(), pvd_a.clone()), (candidate_b.clone(), pvd_b.clone())]
+		{
+			get_hypothetical_membership(
+				&mut virtual_overseer,
+				candidate.hash(),
+				candidate,
+				pvd,
+				vec![leaf_a.hash],
+			)
+			.await;
+		}
+
+		// Fails constraints check
+		get_hypothetical_membership(
+			&mut virtual_overseer,
+			candidate_c.hash(),
+			candidate_c.clone(),
+			pvd_c.clone(),
+			Vec::new(),
+		)
+		.await;
+
+		// Add candidates
+		introduce_seconded_candidate(&mut virtual_overseer, candidate_a.clone(), pvd_a.clone())
+			.await;
+		introduce_seconded_candidate(&mut virtual_overseer, candidate_b.clone(), pvd_b.clone())
+			.await;
+		// Fails constraints check
+		introduce_seconded_candidate_failed(
+			&mut virtual_overseer,
+			candidate_c.clone(),
+			pvd_c.clone(),
+		)
+		.await;
+
+		back_candidate(&mut virtual_overseer, &candidate_a, candidate_a.hash()).await;
+		back_candidate(&mut virtual_overseer, &candidate_b, candidate_b.hash()).await;
+		// This one will not be backed.
+		back_candidate(&mut virtual_overseer, &candidate_c, candidate_c.hash()).await;
+
+		// Expect only A and B to be backable
+		get_backable_candidates(
+			&mut virtual_overseer,
+			&leaf_a,
+			1.into(),
+			Ancestors::default(),
+			5,
+			vec![
+				BackableCandidateRef {
+					candidate_hash: candidate_a.hash(),
+					scheduling_parent: leaf_a.hash,
+				},
+				BackableCandidateRef {
+					candidate_hash: candidate_b.hash(),
+					scheduling_parent: leaf_a.hash,
+				},
+			],
+		)
+		.await;
+		virtual_overseer
+	});
+
+	assert_eq!(view.active_leaves.len(), 1);
+}
+
+#[rstest]
+#[case(RuntimeApiRequest::CONSTRAINTS_RUNTIME_REQUIREMENT)]
+#[case(RuntimeApiRequest::CLAIM_QUEUE_RUNTIME_REQUIREMENT)]
+fn introduce_candidate_multiple_times(#[case] runtime_api_version: u32) {
+	let mut test_state = TestState::default();
+	test_state.set_runtime_api_version(runtime_api_version);
 	let view = test_harness(|mut virtual_overseer| async move {
 		// Leaf A
 		let leaf_a = TestLeaf {
 			number: 100,
 			hash: Hash::from_low_u64_be(130),
 			para_data: vec![
-				(1.into(), PerParaData::new(97, HeadData(vec![1, 2, 3]))),
-				(2.into(), PerParaData::new(100, HeadData(vec![2, 3, 4]))),
+				(1.into(), PerParaData::new(HeadData(vec![1, 2, 3]))),
+				(2.into(), PerParaData::new(HeadData(vec![2, 3, 4]))),
 			],
 		};
 		// Activate leaves.
@@ -809,7 +918,10 @@ fn introduce_candidate_multiple_times() {
 			test_state.validation_code_hash,
 		);
 		let candidate_hash_a = candidate_a.hash();
-		let response_a = vec![(candidate_hash_a, leaf_a.hash)];
+		let response_a = vec![BackableCandidateRef {
+			candidate_hash: candidate_hash_a,
+			scheduling_parent: leaf_a.hash,
+		}];
 
 		// Introduce candidates.
 		introduce_seconded_candidate(&mut virtual_overseer, candidate_a.clone(), pvd_a.clone())
@@ -854,26 +966,24 @@ fn introduce_candidate_multiple_times() {
 }
 
 #[test]
-fn fragment_chain_best_chain_length_is_bounded() {
-	let test_state = TestState::default();
+fn fragment_chain_chain_length_is_bounded() {
+	let mut test_state = TestState::default();
+	test_state.claim_queue.insert(
+		CoreIndex(2),
+		std::iter::repeat(1.into()).take(DEFAULT_SCHEDULING_LOOKAHEAD as _).collect(),
+	);
 	let view = test_harness(|mut virtual_overseer| async move {
 		// Leaf A
 		let leaf_a = TestLeaf {
 			number: 100,
 			hash: Hash::from_low_u64_be(130),
 			para_data: vec![
-				(1.into(), PerParaData::new(97, HeadData(vec![1, 2, 3]))),
-				(2.into(), PerParaData::new(100, HeadData(vec![2, 3, 4]))),
+				(1.into(), PerParaData::new(HeadData(vec![1, 2, 3]))),
+				(2.into(), PerParaData::new(HeadData(vec![2, 3, 4]))),
 			],
 		};
 		// Activate leaves.
-		activate_leaf_with_params(
-			&mut virtual_overseer,
-			&leaf_a,
-			&test_state,
-			AsyncBackingParams { max_candidate_depth: 1, allowed_ancestry_len: 3 },
-		)
-		.await;
+		activate_leaf(&mut virtual_overseer, &leaf_a, &test_state).await;
 
 		// Candidates A, B and C form a chain.
 		let (candidate_a, pvd_a) = make_candidate(
@@ -901,12 +1011,12 @@ fn fragment_chain_best_chain_length_is_bounded() {
 			test_state.validation_code_hash,
 		);
 
-		// Introduce candidates A and B. Since max depth is 1, only these two will be allowed.
+		// Introduce candidates A and B. Since max depth is 2, only these two will be allowed.
 		introduce_seconded_candidate(&mut virtual_overseer, candidate_a.clone(), pvd_a).await;
 		introduce_seconded_candidate(&mut virtual_overseer, candidate_b.clone(), pvd_b).await;
 
 		// Back candidates. Otherwise, we cannot check membership with GetBackableCandidates and
-		// they won't be part of the best chain.
+		// they won't be part of the chain.
 		back_candidate(&mut virtual_overseer, &candidate_a, candidate_a.hash()).await;
 		back_candidate(&mut virtual_overseer, &candidate_b, candidate_b.hash()).await;
 
@@ -917,7 +1027,16 @@ fn fragment_chain_best_chain_length_is_bounded() {
 			1.into(),
 			Ancestors::default(),
 			5,
-			vec![(candidate_a.hash(), leaf_a.hash), (candidate_b.hash(), leaf_a.hash)],
+			vec![
+				BackableCandidateRef {
+					candidate_hash: candidate_a.hash(),
+					scheduling_parent: leaf_a.hash,
+				},
+				BackableCandidateRef {
+					candidate_hash: candidate_b.hash(),
+					scheduling_parent: leaf_a.hash,
+				},
+			],
 		)
 		.await;
 
@@ -932,7 +1051,16 @@ fn fragment_chain_best_chain_length_is_bounded() {
 			1.into(),
 			Ancestors::default(),
 			5,
-			vec![(candidate_a.hash(), leaf_a.hash), (candidate_b.hash(), leaf_a.hash)],
+			vec![
+				BackableCandidateRef {
+					candidate_hash: candidate_a.hash(),
+					scheduling_parent: leaf_a.hash,
+				},
+				BackableCandidateRef {
+					candidate_hash: candidate_b.hash(),
+					scheduling_parent: leaf_a.hash,
+				},
+			],
 		)
 		.await;
 
@@ -953,8 +1081,8 @@ fn introduce_candidate_parent_leaving_view() {
 			number: 100,
 			hash: Hash::from_low_u64_be(130),
 			para_data: vec![
-				(1.into(), PerParaData::new(97, HeadData(vec![1, 2, 3]))),
-				(2.into(), PerParaData::new(100, HeadData(vec![2, 3, 4]))),
+				(1.into(), PerParaData::new(HeadData(vec![1, 2, 3]))),
+				(2.into(), PerParaData::new(HeadData(vec![2, 3, 4]))),
 			],
 		};
 		// Leaf B
@@ -962,8 +1090,8 @@ fn introduce_candidate_parent_leaving_view() {
 			number: 101,
 			hash: Hash::from_low_u64_be(131),
 			para_data: vec![
-				(1.into(), PerParaData::new(99, HeadData(vec![3, 4, 5]))),
-				(2.into(), PerParaData::new(101, HeadData(vec![4, 5, 6]))),
+				(1.into(), PerParaData::new(HeadData(vec![3, 4, 5]))),
+				(2.into(), PerParaData::new(HeadData(vec![4, 5, 6]))),
 			],
 		};
 		// Leaf C
@@ -971,8 +1099,8 @@ fn introduce_candidate_parent_leaving_view() {
 			number: 102,
 			hash: Hash::from_low_u64_be(132),
 			para_data: vec![
-				(1.into(), PerParaData::new(102, HeadData(vec![5, 6, 7]))),
-				(2.into(), PerParaData::new(98, HeadData(vec![6, 7, 8]))),
+				(1.into(), PerParaData::new(HeadData(vec![5, 6, 7]))),
+				(2.into(), PerParaData::new(HeadData(vec![6, 7, 8]))),
 			],
 		};
 
@@ -1013,7 +1141,10 @@ fn introduce_candidate_parent_leaving_view() {
 			test_state.validation_code_hash,
 		);
 		let candidate_hash_b = candidate_b.hash();
-		let response_b = vec![(candidate_hash_b, leaf_b.hash)];
+		let response_b = vec![BackableCandidateRef {
+			candidate_hash: candidate_hash_b,
+			scheduling_parent: leaf_b.hash,
+		}];
 
 		// Candidate C
 		let (candidate_c, pvd_c) = make_candidate(
@@ -1025,7 +1156,10 @@ fn introduce_candidate_parent_leaving_view() {
 			test_state.validation_code_hash,
 		);
 		let candidate_hash_c = candidate_c.hash();
-		let response_c = vec![(candidate_hash_c, leaf_c.hash)];
+		let response_c = vec![BackableCandidateRef {
+			candidate_hash: candidate_hash_c,
+			scheduling_parent: leaf_c.hash,
+		}];
 
 		// Introduce candidates.
 		introduce_seconded_candidate(&mut virtual_overseer, candidate_a1.clone(), pvd_a1).await;
@@ -1169,17 +1303,20 @@ fn introduce_candidate_parent_leaving_view() {
 }
 
 // Introduce a candidate to multiple forks, see how the membership is returned.
-#[test]
-fn introduce_candidate_on_multiple_forks() {
-	let test_state = TestState::default();
+#[rstest]
+#[case(RuntimeApiRequest::CONSTRAINTS_RUNTIME_REQUIREMENT)]
+#[case(RuntimeApiRequest::CLAIM_QUEUE_RUNTIME_REQUIREMENT)]
+fn introduce_candidate_on_multiple_forks(#[case] runtime_api_version: u32) {
+	let mut test_state = TestState::default();
+	test_state.set_runtime_api_version(runtime_api_version);
 	let view = test_harness(|mut virtual_overseer| async move {
 		// Leaf B
 		let leaf_b = TestLeaf {
 			number: 101,
 			hash: Hash::from_low_u64_be(131),
 			para_data: vec![
-				(1.into(), PerParaData::new(99, HeadData(vec![1, 2, 3]))),
-				(2.into(), PerParaData::new(101, HeadData(vec![4, 5, 6]))),
+				(1.into(), PerParaData::new(HeadData(vec![1, 2, 3]))),
+				(2.into(), PerParaData::new(HeadData(vec![4, 5, 6]))),
 			],
 		};
 		// Leaf A
@@ -1187,8 +1324,8 @@ fn introduce_candidate_on_multiple_forks() {
 			number: 100,
 			hash: get_parent_hash(leaf_b.hash),
 			para_data: vec![
-				(1.into(), PerParaData::new(97, HeadData(vec![1, 2, 3]))),
-				(2.into(), PerParaData::new(100, HeadData(vec![2, 3, 4]))),
+				(1.into(), PerParaData::new(HeadData(vec![1, 2, 3]))),
+				(2.into(), PerParaData::new(HeadData(vec![2, 3, 4]))),
 			],
 		};
 
@@ -1206,7 +1343,10 @@ fn introduce_candidate_on_multiple_forks() {
 			test_state.validation_code_hash,
 		);
 		let candidate_hash_a = candidate_a.hash();
-		let response_a = vec![(candidate_hash_a, leaf_a.hash)];
+		let response_a = vec![BackableCandidateRef {
+			candidate_hash: candidate_hash_a,
+			scheduling_parent: leaf_a.hash,
+		}];
 
 		// Introduce candidate. Should be present on leaves B and C.
 		introduce_seconded_candidate(&mut virtual_overseer, candidate_a.clone(), pvd_a).await;
@@ -1238,19 +1378,29 @@ fn introduce_candidate_on_multiple_forks() {
 	assert_eq!(view.active_leaves.len(), 2);
 }
 
-#[test]
-fn unconnected_candidates_become_connected() {
+#[rstest]
+#[case(RuntimeApiRequest::CONSTRAINTS_RUNTIME_REQUIREMENT)]
+#[case(RuntimeApiRequest::CLAIM_QUEUE_RUNTIME_REQUIREMENT)]
+fn unconnected_candidates_become_connected(#[case] runtime_api_version: u32) {
 	// This doesn't test all the complicated cases with many unconnected candidates, as it's more
 	// extensively tested in the `fragment_chain::tests` module.
-	let test_state = TestState::default();
+	let mut test_state = TestState::default();
+	for i in 2..=4 {
+		test_state.claim_queue.insert(
+			CoreIndex(i),
+			std::iter::repeat(1.into()).take(DEFAULT_SCHEDULING_LOOKAHEAD as _).collect(),
+		);
+	}
+
+	test_state.set_runtime_api_version(runtime_api_version);
 	let view = test_harness(|mut virtual_overseer| async move {
 		// Leaf A
 		let leaf_a = TestLeaf {
 			number: 100,
 			hash: Hash::from_low_u64_be(130),
 			para_data: vec![
-				(1.into(), PerParaData::new(97, HeadData(vec![1, 2, 3]))),
-				(2.into(), PerParaData::new(100, HeadData(vec![2, 3, 4]))),
+				(1.into(), PerParaData::new(HeadData(vec![1, 2, 3]))),
+				(2.into(), PerParaData::new(HeadData(vec![2, 3, 4]))),
 			],
 		};
 		// Activate leaves.
@@ -1310,7 +1460,10 @@ fn unconnected_candidates_become_connected() {
 			1.into(),
 			Ancestors::default(),
 			5,
-			vec![(candidate_a.hash(), leaf_a.hash)],
+			vec![BackableCandidateRef {
+				candidate_hash: candidate_a.hash(),
+				scheduling_parent: leaf_a.hash,
+			}],
 		)
 		.await;
 
@@ -1325,10 +1478,22 @@ fn unconnected_candidates_become_connected() {
 			Ancestors::default(),
 			5,
 			vec![
-				(candidate_a.hash(), leaf_a.hash),
-				(candidate_b.hash(), leaf_a.hash),
-				(candidate_c.hash(), leaf_a.hash),
-				(candidate_d.hash(), leaf_a.hash),
+				BackableCandidateRef {
+					candidate_hash: candidate_a.hash(),
+					scheduling_parent: leaf_a.hash,
+				},
+				BackableCandidateRef {
+					candidate_hash: candidate_b.hash(),
+					scheduling_parent: leaf_a.hash,
+				},
+				BackableCandidateRef {
+					candidate_hash: candidate_c.hash(),
+					scheduling_parent: leaf_a.hash,
+				},
+				BackableCandidateRef {
+					candidate_hash: candidate_d.hash(),
+					scheduling_parent: leaf_a.hash,
+				},
 			],
 		)
 		.await;
@@ -1342,15 +1507,19 @@ fn unconnected_candidates_become_connected() {
 // Backs some candidates and tests `GetBackableCandidates` when requesting a single candidate.
 #[test]
 fn check_backable_query_single_candidate() {
-	let test_state = TestState::default();
+	let mut test_state = TestState::default();
+	test_state.claim_queue.insert(
+		CoreIndex(2),
+		std::iter::repeat(1.into()).take(DEFAULT_SCHEDULING_LOOKAHEAD as _).collect(),
+	);
 	let view = test_harness(|mut virtual_overseer| async move {
 		// Leaf A
 		let leaf_a = TestLeaf {
 			number: 100,
 			hash: Hash::from_low_u64_be(130),
 			para_data: vec![
-				(1.into(), PerParaData::new(97, HeadData(vec![1, 2, 3]))),
-				(2.into(), PerParaData::new(100, HeadData(vec![2, 3, 4]))),
+				(1.into(), PerParaData::new(HeadData(vec![1, 2, 3]))),
+				(2.into(), PerParaData::new(HeadData(vec![2, 3, 4]))),
 			],
 		};
 
@@ -1378,7 +1547,7 @@ fn check_backable_query_single_candidate() {
 			test_state.validation_code_hash,
 		);
 		// Set a field to make this candidate unique.
-		candidate_b.descriptor.para_head = Hash::from_low_u64_le(1000);
+		candidate_b.descriptor.set_para_head(Hash::from_low_u64_le(1000));
 		let candidate_hash_b = candidate_b.hash();
 
 		// Introduce candidates.
@@ -1449,7 +1618,10 @@ fn check_backable_query_single_candidate() {
 			1.into(),
 			Ancestors::new(),
 			1,
-			vec![(candidate_hash_a, leaf_a.hash)],
+			vec![BackableCandidateRef {
+				candidate_hash: candidate_hash_a,
+				scheduling_parent: leaf_a.hash,
+			}],
 		)
 		.await;
 		get_backable_candidates(
@@ -1458,7 +1630,10 @@ fn check_backable_query_single_candidate() {
 			1.into(),
 			vec![candidate_hash_a].into_iter().collect(),
 			1,
-			vec![(candidate_hash_b, leaf_a.hash)],
+			vec![BackableCandidateRef {
+				candidate_hash: candidate_hash_b,
+				scheduling_parent: leaf_a.hash,
+			}],
 		)
 		.await;
 
@@ -1469,7 +1644,10 @@ fn check_backable_query_single_candidate() {
 			1.into(),
 			vec![candidate_hash_b].into_iter().collect(),
 			1,
-			vec![(candidate_hash_a, leaf_a.hash)],
+			vec![BackableCandidateRef {
+				candidate_hash: candidate_hash_a,
+				scheduling_parent: leaf_a.hash,
+			}],
 		)
 		.await;
 
@@ -1480,17 +1658,31 @@ fn check_backable_query_single_candidate() {
 }
 
 // Backs some candidates and tests `GetBackableCandidates` when requesting a multiple candidates.
-#[test]
-fn check_backable_query_multiple_candidates() {
-	let test_state = TestState::default();
+#[rstest]
+#[case(RuntimeApiRequest::CONSTRAINTS_RUNTIME_REQUIREMENT)]
+#[case(RuntimeApiRequest::CLAIM_QUEUE_RUNTIME_REQUIREMENT)]
+
+fn check_backable_query_multiple_candidates(#[case] runtime_api_version: u32) {
+	// This doesn't test all the complicated cases with many unconnected candidates, as it's more
+	// extensively tested in the `fragment_chain::tests` module.
+	let mut test_state = TestState::default();
+	test_state.set_runtime_api_version(runtime_api_version);
+	// Add three more cores for para A, so that we can get a chain of max length 4
+	for i in 2..=4 {
+		test_state.claim_queue.insert(
+			CoreIndex(i),
+			std::iter::repeat(1.into()).take(DEFAULT_SCHEDULING_LOOKAHEAD as _).collect(),
+		);
+	}
+
 	let view = test_harness(|mut virtual_overseer| async move {
 		// Leaf A
 		let leaf_a = TestLeaf {
 			number: 100,
 			hash: Hash::from_low_u64_be(130),
 			para_data: vec![
-				(1.into(), PerParaData::new(97, HeadData(vec![1, 2, 3]))),
-				(2.into(), PerParaData::new(100, HeadData(vec![2, 3, 4]))),
+				(1.into(), PerParaData::new(HeadData(vec![1, 2, 3]))),
+				(2.into(), PerParaData::new(HeadData(vec![2, 3, 4]))),
 			],
 		};
 
@@ -1556,7 +1748,10 @@ fn check_backable_query_multiple_candidates() {
 				1.into(),
 				Ancestors::new(),
 				1,
-				vec![(candidate_hash_a, leaf_a.hash)],
+				vec![BackableCandidateRef {
+					candidate_hash: candidate_hash_a,
+					scheduling_parent: leaf_a.hash,
+				}],
 			)
 			.await;
 			for count in 4..10 {
@@ -1567,10 +1762,22 @@ fn check_backable_query_multiple_candidates() {
 					Ancestors::new(),
 					count,
 					vec![
-						(candidate_hash_a, leaf_a.hash),
-						(candidate_hash_b, leaf_a.hash),
-						(candidate_hash_c, leaf_a.hash),
-						(candidate_hash_d, leaf_a.hash),
+						BackableCandidateRef {
+							candidate_hash: candidate_hash_a,
+							scheduling_parent: leaf_a.hash,
+						},
+						BackableCandidateRef {
+							candidate_hash: candidate_hash_b,
+							scheduling_parent: leaf_a.hash,
+						},
+						BackableCandidateRef {
+							candidate_hash: candidate_hash_c,
+							scheduling_parent: leaf_a.hash,
+						},
+						BackableCandidateRef {
+							candidate_hash: candidate_hash_d,
+							scheduling_parent: leaf_a.hash,
+						},
 					],
 				)
 				.await;
@@ -1585,7 +1792,10 @@ fn check_backable_query_multiple_candidates() {
 				1.into(),
 				vec![candidate_hash_a].into_iter().collect(),
 				1,
-				vec![(candidate_hash_b, leaf_a.hash)],
+				vec![BackableCandidateRef {
+					candidate_hash: candidate_hash_b,
+					scheduling_parent: leaf_a.hash,
+				}],
 			)
 			.await;
 			get_backable_candidates(
@@ -1594,7 +1804,16 @@ fn check_backable_query_multiple_candidates() {
 				1.into(),
 				vec![candidate_hash_a].into_iter().collect(),
 				2,
-				vec![(candidate_hash_b, leaf_a.hash), (candidate_hash_c, leaf_a.hash)],
+				vec![
+					BackableCandidateRef {
+						candidate_hash: candidate_hash_b,
+						scheduling_parent: leaf_a.hash,
+					},
+					BackableCandidateRef {
+						candidate_hash: candidate_hash_c,
+						scheduling_parent: leaf_a.hash,
+					},
+				],
 			)
 			.await;
 
@@ -1608,9 +1827,18 @@ fn check_backable_query_multiple_candidates() {
 					vec![candidate_hash_a].into_iter().collect(),
 					count,
 					vec![
-						(candidate_hash_b, leaf_a.hash),
-						(candidate_hash_c, leaf_a.hash),
-						(candidate_hash_d, leaf_a.hash),
+						BackableCandidateRef {
+							candidate_hash: candidate_hash_b,
+							scheduling_parent: leaf_a.hash,
+						},
+						BackableCandidateRef {
+							candidate_hash: candidate_hash_c,
+							scheduling_parent: leaf_a.hash,
+						},
+						BackableCandidateRef {
+							candidate_hash: candidate_hash_d,
+							scheduling_parent: leaf_a.hash,
+						},
 					],
 				)
 				.await;
@@ -1625,7 +1853,10 @@ fn check_backable_query_multiple_candidates() {
 				1.into(),
 				vec![candidate_hash_a, candidate_hash_b, candidate_hash_c].into_iter().collect(),
 				1,
-				vec![(candidate_hash_d, leaf_a.hash)],
+				vec![BackableCandidateRef {
+					candidate_hash: candidate_hash_d,
+					scheduling_parent: leaf_a.hash,
+				}],
 			)
 			.await;
 
@@ -1635,7 +1866,10 @@ fn check_backable_query_multiple_candidates() {
 				1.into(),
 				vec![candidate_hash_a, candidate_hash_b].into_iter().collect(),
 				1,
-				vec![(candidate_hash_c, leaf_a.hash)],
+				vec![BackableCandidateRef {
+					candidate_hash: candidate_hash_c,
+					scheduling_parent: leaf_a.hash,
+				}],
 			)
 			.await;
 
@@ -1648,7 +1882,16 @@ fn check_backable_query_multiple_candidates() {
 					1.into(),
 					vec![candidate_hash_a, candidate_hash_b].into_iter().collect(),
 					count,
-					vec![(candidate_hash_c, leaf_a.hash), (candidate_hash_d, leaf_a.hash)],
+					vec![
+						BackableCandidateRef {
+							candidate_hash: candidate_hash_c,
+							scheduling_parent: leaf_a.hash,
+						},
+						BackableCandidateRef {
+							candidate_hash: candidate_hash_d,
+							scheduling_parent: leaf_a.hash,
+						},
+					],
 				)
 				.await;
 			}
@@ -1676,7 +1919,10 @@ fn check_backable_query_multiple_candidates() {
 			1.into(),
 			vec![candidate_hash_b].into_iter().collect(),
 			1,
-			vec![(candidate_hash_a, leaf_a.hash)],
+			vec![BackableCandidateRef {
+				candidate_hash: candidate_hash_a,
+				scheduling_parent: leaf_a.hash,
+			}],
 		)
 		.await;
 		get_backable_candidates(
@@ -1686,9 +1932,18 @@ fn check_backable_query_multiple_candidates() {
 			vec![candidate_hash_b, candidate_hash_c].into_iter().collect(),
 			3,
 			vec![
-				(candidate_hash_a, leaf_a.hash),
-				(candidate_hash_b, leaf_a.hash),
-				(candidate_hash_c, leaf_a.hash),
+				BackableCandidateRef {
+					candidate_hash: candidate_hash_a,
+					scheduling_parent: leaf_a.hash,
+				},
+				BackableCandidateRef {
+					candidate_hash: candidate_hash_b,
+					scheduling_parent: leaf_a.hash,
+				},
+				BackableCandidateRef {
+					candidate_hash: candidate_hash_c,
+					scheduling_parent: leaf_a.hash,
+				},
 			],
 		)
 		.await;
@@ -1699,7 +1954,16 @@ fn check_backable_query_multiple_candidates() {
 			1.into(),
 			vec![candidate_hash_a, candidate_hash_c, candidate_hash_d].into_iter().collect(),
 			2,
-			vec![(candidate_hash_b, leaf_a.hash), (candidate_hash_c, leaf_a.hash)],
+			vec![
+				BackableCandidateRef {
+					candidate_hash: candidate_hash_b,
+					scheduling_parent: leaf_a.hash,
+				},
+				BackableCandidateRef {
+					candidate_hash: candidate_hash_c,
+					scheduling_parent: leaf_a.hash,
+				},
+			],
 		)
 		.await;
 
@@ -1712,7 +1976,16 @@ fn check_backable_query_multiple_candidates() {
 				.into_iter()
 				.collect(),
 			2,
-			vec![(candidate_hash_b, leaf_a.hash), (candidate_hash_c, leaf_a.hash)],
+			vec![
+				BackableCandidateRef {
+					candidate_hash: candidate_hash_b,
+					scheduling_parent: leaf_a.hash,
+				},
+				BackableCandidateRef {
+					candidate_hash: candidate_hash_c,
+					scheduling_parent: leaf_a.hash,
+				},
+			],
 		)
 		.await;
 
@@ -1752,17 +2025,21 @@ fn check_backable_query_multiple_candidates() {
 }
 
 // Test hypothetical membership query.
-#[test]
-fn check_hypothetical_membership_query() {
-	let test_state = TestState::default();
+#[rstest]
+#[case(RuntimeApiRequest::CONSTRAINTS_RUNTIME_REQUIREMENT)]
+#[case(RuntimeApiRequest::CLAIM_QUEUE_RUNTIME_REQUIREMENT)]
+fn check_hypothetical_membership_query(#[case] runtime_api_version: u32) {
+	let mut test_state = TestState::default();
+	test_state.set_runtime_api_version(runtime_api_version);
+
 	let view = test_harness(|mut virtual_overseer| async move {
 		// Leaf B
 		let leaf_b = TestLeaf {
 			number: 101,
 			hash: Hash::from_low_u64_be(131),
 			para_data: vec![
-				(1.into(), PerParaData::new(97, HeadData(vec![1, 2, 3]))),
-				(2.into(), PerParaData::new(100, HeadData(vec![2, 3, 4]))),
+				(1.into(), PerParaData::new(HeadData(vec![1, 2, 3]))),
+				(2.into(), PerParaData::new(HeadData(vec![2, 3, 4]))),
 			],
 		};
 		// Leaf A
@@ -1770,26 +2047,14 @@ fn check_hypothetical_membership_query() {
 			number: 100,
 			hash: get_parent_hash(leaf_b.hash),
 			para_data: vec![
-				(1.into(), PerParaData::new(98, HeadData(vec![1, 2, 3]))),
-				(2.into(), PerParaData::new(100, HeadData(vec![2, 3, 4]))),
+				(1.into(), PerParaData::new(HeadData(vec![1, 2, 3]))),
+				(2.into(), PerParaData::new(HeadData(vec![2, 3, 4]))),
 			],
 		};
 
 		// Activate leaves.
-		activate_leaf_with_params(
-			&mut virtual_overseer,
-			&leaf_a,
-			&test_state,
-			AsyncBackingParams { allowed_ancestry_len: 3, max_candidate_depth: 1 },
-		)
-		.await;
-		activate_leaf_with_params(
-			&mut virtual_overseer,
-			&leaf_b,
-			&test_state,
-			AsyncBackingParams { allowed_ancestry_len: 3, max_candidate_depth: 1 },
-		)
-		.await;
+		activate_leaf(&mut virtual_overseer, &leaf_a, &test_state).await;
+		activate_leaf(&mut virtual_overseer, &leaf_b, &test_state).await;
 
 		// Candidates will be valid on both leaves.
 
@@ -1845,7 +2110,7 @@ fn check_hypothetical_membership_query() {
 			.await;
 
 		// Get membership of candidates after adding A. They all are still unconnected candidates
-		// (not part of the best backable chain).
+		// (not part of the backable chain).
 		for (candidate, pvd) in [
 			(candidate_a.clone(), pvd_a.clone()),
 			(candidate_b.clone(), pvd_b.clone()),
@@ -1861,7 +2126,7 @@ fn check_hypothetical_membership_query() {
 			.await;
 		}
 
-		// Back A. Now A is part of the best chain the rest can be added as unconnected.
+		// Back A. Now A is part of the chain, the rest can be added as unconnected.
 
 		back_candidate(&mut virtual_overseer, &candidate_a, candidate_a.hash()).await;
 
@@ -1891,6 +2156,17 @@ fn check_hypothetical_membership_query() {
 		);
 		introduce_seconded_candidate_failed(&mut virtual_overseer, candidate_d, pvd_d).await;
 
+		// Candidate E has invalid head data.
+		let (candidate_e, pvd_e) = make_candidate(
+			leaf_a.hash,
+			leaf_a.number,
+			1.into(),
+			HeadData(vec![2]),
+			HeadData(vec![0; 20481]),
+			test_state.validation_code_hash,
+		);
+		introduce_seconded_candidate_failed(&mut virtual_overseer, candidate_e, pvd_e).await;
+
 		// Add candidate B and back it.
 		introduce_seconded_candidate(&mut virtual_overseer, candidate_b.clone(), pvd_b.clone())
 			.await;
@@ -1918,17 +2194,22 @@ fn check_hypothetical_membership_query() {
 	assert_eq!(view.active_leaves.len(), 2);
 }
 
-#[test]
-fn check_pvd_query() {
-	let test_state = TestState::default();
+#[rstest]
+#[case(RuntimeApiRequest::CONSTRAINTS_RUNTIME_REQUIREMENT)]
+#[case(RuntimeApiRequest::CLAIM_QUEUE_RUNTIME_REQUIREMENT)]
+fn check_pvd_query(#[case] runtime_api_version: u32) {
+	// This doesn't test all the complicated cases with many unconnected candidates, as it's more
+	// extensively tested in the `fragment_chain::tests` module.
+	let mut test_state = TestState::default();
+	test_state.set_runtime_api_version(runtime_api_version);
 	let view = test_harness(|mut virtual_overseer| async move {
 		// Leaf A
 		let leaf_a = TestLeaf {
 			number: 100,
 			hash: Hash::from_low_u64_be(130),
 			para_data: vec![
-				(1.into(), PerParaData::new(97, HeadData(vec![1, 2, 3]))),
-				(2.into(), PerParaData::new(100, HeadData(vec![2, 3, 4]))),
+				(1.into(), PerParaData::new(HeadData(vec![1, 2, 3]))),
+				(2.into(), PerParaData::new(HeadData(vec![2, 3, 4]))),
 			],
 		};
 
@@ -2055,14 +2336,9 @@ fn check_pvd_query() {
 
 // Test simultaneously activating and deactivating leaves, and simultaneously deactivating
 // multiple leaves.
-// This test is parametrised with the runtime api version. For versions that don't support the claim
-// queue API, we check that av-cores are used.
-#[rstest]
-#[case(RuntimeApiRequest::CLAIM_QUEUE_RUNTIME_REQUIREMENT)]
-#[case(8)]
-fn correctly_updates_leaves(#[case] runtime_api_version: u32) {
-	let mut test_state = TestState::default();
-	test_state.set_runtime_api_version(runtime_api_version);
+#[test]
+fn correctly_updates_leaves() {
+	let test_state = TestState::default();
 
 	let view = test_harness(|mut virtual_overseer| async move {
 		// Leaf A
@@ -2070,8 +2346,8 @@ fn correctly_updates_leaves(#[case] runtime_api_version: u32) {
 			number: 100,
 			hash: Hash::from_low_u64_be(130),
 			para_data: vec![
-				(1.into(), PerParaData::new(97, HeadData(vec![1, 2, 3]))),
-				(2.into(), PerParaData::new(100, HeadData(vec![2, 3, 4]))),
+				(1.into(), PerParaData::new(HeadData(vec![1, 2, 3]))),
+				(2.into(), PerParaData::new(HeadData(vec![2, 3, 4]))),
 			],
 		};
 		// Leaf B
@@ -2079,8 +2355,8 @@ fn correctly_updates_leaves(#[case] runtime_api_version: u32) {
 			number: 101,
 			hash: Hash::from_low_u64_be(131),
 			para_data: vec![
-				(1.into(), PerParaData::new(99, HeadData(vec![3, 4, 5]))),
-				(2.into(), PerParaData::new(101, HeadData(vec![4, 5, 6]))),
+				(1.into(), PerParaData::new(HeadData(vec![3, 4, 5]))),
+				(2.into(), PerParaData::new(HeadData(vec![4, 5, 6]))),
 			],
 		};
 		// Leaf C
@@ -2088,13 +2364,14 @@ fn correctly_updates_leaves(#[case] runtime_api_version: u32) {
 			number: 102,
 			hash: Hash::from_low_u64_be(132),
 			para_data: vec![
-				(1.into(), PerParaData::new(102, HeadData(vec![5, 6, 7]))),
-				(2.into(), PerParaData::new(98, HeadData(vec![6, 7, 8]))),
+				(1.into(), PerParaData::new(HeadData(vec![5, 6, 7]))),
+				(2.into(), PerParaData::new(HeadData(vec![6, 7, 8]))),
 			],
 		};
 
 		// Activate leaves.
 		activate_leaf(&mut virtual_overseer, &leaf_a, &test_state).await;
+
 		activate_leaf(&mut virtual_overseer, &leaf_b, &test_state).await;
 
 		// Try activating a duplicate leaf.
@@ -2115,14 +2392,7 @@ fn correctly_updates_leaves(#[case] runtime_api_version: u32) {
 		virtual_overseer
 			.send(FromOrchestra::Signal(OverseerSignal::ActiveLeaves(update)))
 			.await;
-		handle_leaf_activation(
-			&mut virtual_overseer,
-			&leaf_c,
-			&test_state,
-			ASYNC_BACKING_PARAMETERS,
-			get_parent_hash,
-		)
-		.await;
+		handle_leaf_activation(&mut virtual_overseer, &leaf_c, &test_state, get_parent_hash).await;
 
 		// Remove all remaining leaves.
 		let update = ActiveLeavesUpdate {
@@ -2158,22 +2428,31 @@ fn correctly_updates_leaves(#[case] runtime_api_version: u32) {
 	assert_eq!(view.active_leaves.len(), 0);
 }
 
-#[test]
-fn handle_active_leaves_update_gets_candidates_from_parent() {
+#[rstest]
+#[case(RuntimeApiRequest::CONSTRAINTS_RUNTIME_REQUIREMENT)]
+#[case(RuntimeApiRequest::CLAIM_QUEUE_RUNTIME_REQUIREMENT)]
+fn handle_active_leaves_update_gets_candidates_from_parent(#[case] runtime_api_version: u32) {
 	let para_id = ParaId::from(1);
+
+	// This doesn't test all the complicated cases with many unconnected candidates, as it's more
+	// extensively tested in the `fragment_chain::tests` module.
 	let mut test_state = TestState::default();
-	test_state.claim_queue = test_state
-		.claim_queue
-		.into_iter()
-		.filter(|(_, paras)| matches!(paras.front(), Some(para) if para == &para_id))
-		.collect();
-	assert_eq!(test_state.claim_queue.len(), 1);
+	test_state.set_runtime_api_version(runtime_api_version);
+
+	test_state.claim_queue = BTreeMap::new();
+	for i in 0..=4 {
+		test_state.claim_queue.insert(
+			CoreIndex(i),
+			std::iter::repeat(para_id).take(DEFAULT_SCHEDULING_LOOKAHEAD as _).collect(),
+		);
+	}
+
 	let view = test_harness(|mut virtual_overseer| async move {
 		// Leaf A
 		let leaf_a = TestLeaf {
 			number: 100,
 			hash: Hash::from_low_u64_be(130),
-			para_data: vec![(para_id, PerParaData::new(97, HeadData(vec![1, 2, 3])))],
+			para_data: vec![(para_id, PerParaData::new(HeadData(vec![1, 2, 3])))],
 		};
 		// Activate leaf A.
 		activate_leaf(&mut virtual_overseer, &leaf_a, &test_state).await;
@@ -2199,10 +2478,22 @@ fn handle_active_leaves_update_gets_candidates_from_parent() {
 			make_and_back_candidate!(test_state, virtual_overseer, leaf_a, &candidate_c, 4);
 
 		let mut all_candidates_resp = vec![
-			(candidate_hash_a, leaf_a.hash),
-			(candidate_hash_b, leaf_a.hash),
-			(candidate_hash_c, leaf_a.hash),
-			(candidate_hash_d, leaf_a.hash),
+			BackableCandidateRef {
+				candidate_hash: candidate_hash_a,
+				scheduling_parent: leaf_a.hash,
+			},
+			BackableCandidateRef {
+				candidate_hash: candidate_hash_b,
+				scheduling_parent: leaf_a.hash,
+			},
+			BackableCandidateRef {
+				candidate_hash: candidate_hash_c,
+				scheduling_parent: leaf_a.hash,
+			},
+			BackableCandidateRef {
+				candidate_hash: candidate_hash_d,
+				scheduling_parent: leaf_a.hash,
+			},
 		];
 
 		// Check candidate tree membership.
@@ -2224,7 +2515,6 @@ fn handle_active_leaves_update_gets_candidates_from_parent() {
 			para_data: vec![(
 				para_id,
 				PerParaData::new_with_pending(
-					98,
 					HeadData(vec![1, 2, 3]),
 					vec![
 						CandidatePendingAvailability {
@@ -2263,7 +2553,16 @@ fn handle_active_leaves_update_gets_candidates_from_parent() {
 			para_id,
 			[candidate_a.hash(), candidate_b.hash()].into_iter().collect(),
 			5,
-			vec![(candidate_c.hash(), leaf_a.hash), (candidate_d.hash(), leaf_a.hash)],
+			vec![
+				BackableCandidateRef {
+					candidate_hash: candidate_c.hash(),
+					scheduling_parent: leaf_a.hash,
+				},
+				BackableCandidateRef {
+					candidate_hash: candidate_d.hash(),
+					scheduling_parent: leaf_a.hash,
+				},
+			],
 		)
 		.await;
 
@@ -2306,7 +2605,16 @@ fn handle_active_leaves_update_gets_candidates_from_parent() {
 			para_id,
 			[candidate_a.hash(), candidate_b.hash()].into_iter().collect(),
 			5,
-			vec![(candidate_c.hash(), leaf_a.hash), (candidate_d.hash(), leaf_a.hash)],
+			vec![
+				BackableCandidateRef {
+					candidate_hash: candidate_c.hash(),
+					scheduling_parent: leaf_a.hash,
+				},
+				BackableCandidateRef {
+					candidate_hash: candidate_d.hash(),
+					scheduling_parent: leaf_a.hash,
+				},
+			],
 		)
 		.await;
 
@@ -2317,7 +2625,7 @@ fn handle_active_leaves_update_gets_candidates_from_parent() {
 			hash: Hash::from_low_u64_be(12),
 			para_data: vec![(
 				para_id,
-				PerParaData::new_with_pending(98, HeadData(vec![1, 2, 3]), vec![]),
+				PerParaData::new_with_pending(HeadData(vec![1, 2, 3]), vec![]),
 			)],
 		};
 
@@ -2336,7 +2644,16 @@ fn handle_active_leaves_update_gets_candidates_from_parent() {
 			para_id,
 			[candidate_a.hash(), candidate_b.hash()].into_iter().collect(),
 			5,
-			vec![(candidate_c.hash(), leaf_a.hash), (candidate_d.hash(), leaf_a.hash)],
+			vec![
+				BackableCandidateRef {
+					candidate_hash: candidate_c.hash(),
+					scheduling_parent: leaf_a.hash,
+				},
+				BackableCandidateRef {
+					candidate_hash: candidate_d.hash(),
+					scheduling_parent: leaf_a.hash,
+				},
+			],
 		)
 		.await;
 
@@ -2373,14 +2690,26 @@ fn handle_active_leaves_update_gets_candidates_from_parent() {
 			[candidate_a.hash(), candidate_b.hash()].into_iter().collect(),
 			5,
 			vec![
-				(candidate_c.hash(), leaf_a.hash),
-				(candidate_d.hash(), leaf_a.hash),
-				(candidate_e.hash(), leaf_a.hash),
+				BackableCandidateRef {
+					candidate_hash: candidate_c.hash(),
+					scheduling_parent: leaf_a.hash,
+				},
+				BackableCandidateRef {
+					candidate_hash: candidate_d.hash(),
+					scheduling_parent: leaf_a.hash,
+				},
+				BackableCandidateRef {
+					candidate_hash: candidate_e.hash(),
+					scheduling_parent: leaf_a.hash,
+				},
 			],
 		)
 		.await;
 
-		all_candidates_resp.push((candidate_e.hash(), leaf_a.hash));
+		all_candidates_resp.push(BackableCandidateRef {
+			candidate_hash: candidate_e.hash(),
+			scheduling_parent: leaf_a.hash,
+		});
 		get_backable_candidates(
 			&mut virtual_overseer,
 			&leaf_c,
@@ -2420,13 +2749,12 @@ fn handle_active_leaves_update_bounded_implicit_view() {
 		.collect();
 	assert_eq!(test_state.claim_queue.len(), 1);
 
+	let scheduling_lookahead = DEFAULT_SCHEDULING_LOOKAHEAD;
+
 	let mut leaves = vec![TestLeaf {
 		number: 100,
 		hash: Hash::from_low_u64_be(130),
-		para_data: vec![(
-			para_id,
-			PerParaData::new(100 - ALLOWED_ANCESTRY_LEN, HeadData(vec![1, 2, 3])),
-		)],
+		para_data: vec![(para_id, PerParaData::new(HeadData(vec![1, 2, 3])))],
 	}];
 
 	for index in 1..10 {
@@ -2434,13 +2762,7 @@ fn handle_active_leaves_update_bounded_implicit_view() {
 		leaves.push(TestLeaf {
 			number: prev_leaf.number - 1,
 			hash: get_parent_hash(prev_leaf.hash),
-			para_data: vec![(
-				para_id,
-				PerParaData::new(
-					prev_leaf.number - 1 - ALLOWED_ANCESTRY_LEN,
-					HeadData(vec![1, 2, 3]),
-				),
-			)],
+			para_data: vec![(para_id, PerParaData::new(HeadData(vec![1, 2, 3])))],
 		});
 	}
 	leaves.reverse();
@@ -2461,22 +2783,24 @@ fn handle_active_leaves_update_bounded_implicit_view() {
 
 	// Only latest leaf is active.
 	assert_eq!(view.active_leaves.len(), 1);
-	// We keep allowed_ancestry_len implicit leaves. The latest leaf is also present here.
-	assert_eq!(
-		view.per_relay_parent.len() as u32,
-		ASYNC_BACKING_PARAMETERS.allowed_ancestry_len + 1
-	);
+	// We keep scheduling_lookahead - 1 implicit leaves. The latest leaf is also present here.
+	assert_eq!(view.per_relay_parent.len() as u32, scheduling_lookahead);
 
 	assert_eq!(view.active_leaves, [leaves[9].hash].into_iter().collect());
 	assert_eq!(
 		view.per_relay_parent.into_keys().collect::<HashSet<_>>(),
-		leaves[6..].into_iter().map(|l| l.hash).collect::<HashSet<_>>()
+		leaves[7..].into_iter().map(|l| l.hash).collect::<HashSet<_>>()
 	);
 }
 
-#[test]
-fn persists_pending_availability_candidate() {
+#[rstest]
+#[case(RuntimeApiRequest::CONSTRAINTS_RUNTIME_REQUIREMENT)]
+#[case(RuntimeApiRequest::CLAIM_QUEUE_RUNTIME_REQUIREMENT)]
+fn persists_pending_availability_candidate(#[case] runtime_api_version: u32) {
+	// This doesn't test all the complicated cases with many unconnected candidates, as it's more
+	// extensively tested in the `fragment_chain::tests` module.
 	let mut test_state = TestState::default();
+	test_state.set_runtime_api_version(runtime_api_version);
 	let para_id = ParaId::from(1);
 	test_state.claim_queue = test_state
 		.claim_queue
@@ -2489,16 +2813,14 @@ fn persists_pending_availability_candidate() {
 		let para_head = HeadData(vec![1, 2, 3]);
 
 		// Min allowed relay parent for leaf `a` which goes out of scope in the test.
-		let candidate_relay_parent = Hash::from_low_u64_be(5);
+		// Block 97 will have hash 0x04 given the ancestry chain from leaf_a (hash 0x02).
+		let candidate_relay_parent = Hash::from_low_u64_be(4);
 		let candidate_relay_parent_number = 97;
 
 		let leaf_a = TestLeaf {
-			number: candidate_relay_parent_number + ALLOWED_ANCESTRY_LEN,
+			number: candidate_relay_parent_number + (DEFAULT_SCHEDULING_LOOKAHEAD - 1),
 			hash: Hash::from_low_u64_be(2),
-			para_data: vec![(
-				para_id,
-				PerParaData::new(candidate_relay_parent_number, para_head.clone()),
-			)],
+			para_data: vec![(para_id, PerParaData::new(para_head.clone()))],
 		};
 
 		let leaf_b_hash = Hash::from_low_u64_be(1);
@@ -2546,11 +2868,7 @@ fn persists_pending_availability_candidate() {
 			hash: leaf_b_hash,
 			para_data: vec![(
 				1.into(),
-				PerParaData::new_with_pending(
-					candidate_relay_parent_number + 1,
-					para_head.clone(),
-					vec![candidate_a_pending_av],
-				),
+				PerParaData::new_with_pending(para_head.clone(), vec![candidate_a_pending_av]),
 			)],
 		};
 		activate_leaf(&mut virtual_overseer, &leaf_b, &test_state).await;
@@ -2573,97 +2891,10 @@ fn persists_pending_availability_candidate() {
 			para_id,
 			vec![candidate_hash_a].into_iter().collect(),
 			1,
-			vec![(candidate_hash_b, leaf_b_hash)],
-		)
-		.await;
-
-		virtual_overseer
-	});
-}
-
-#[test]
-fn backwards_compatible_with_non_async_backing_params() {
-	let mut test_state = TestState::default();
-	let para_id = ParaId::from(1);
-	test_state.claim_queue = test_state
-		.claim_queue
-		.into_iter()
-		.filter(|(_, paras)| matches!(paras.front(), Some(para) if para == &para_id))
-		.collect();
-	assert_eq!(test_state.claim_queue.len(), 1);
-
-	test_harness(|mut virtual_overseer| async move {
-		let para_head = HeadData(vec![1, 2, 3]);
-
-		let leaf_b_hash = Hash::repeat_byte(15);
-		let candidate_relay_parent = get_parent_hash(leaf_b_hash);
-		let candidate_relay_parent_number = 100;
-
-		let leaf_a = TestLeaf {
-			number: candidate_relay_parent_number,
-			hash: candidate_relay_parent,
-			para_data: vec![(
-				para_id,
-				PerParaData::new(candidate_relay_parent_number, para_head.clone()),
-			)],
-		};
-
-		// Activate leaf.
-		activate_leaf_with_params(
-			&mut virtual_overseer,
-			&leaf_a,
-			&test_state,
-			AsyncBackingParams { allowed_ancestry_len: 0, max_candidate_depth: 0 },
-		)
-		.await;
-
-		// Candidate A
-		let (candidate_a, pvd_a) = make_candidate(
-			candidate_relay_parent,
-			candidate_relay_parent_number,
-			para_id,
-			para_head.clone(),
-			HeadData(vec![1]),
-			test_state.validation_code_hash,
-		);
-		let candidate_hash_a = candidate_a.hash();
-
-		introduce_seconded_candidate(&mut virtual_overseer, candidate_a.clone(), pvd_a).await;
-		back_candidate(&mut virtual_overseer, &candidate_a, candidate_hash_a).await;
-
-		get_backable_candidates(
-			&mut virtual_overseer,
-			&leaf_a,
-			para_id,
-			Ancestors::new(),
-			1,
-			vec![(candidate_hash_a, candidate_relay_parent)],
-		)
-		.await;
-
-		let leaf_b = TestLeaf {
-			number: candidate_relay_parent_number + 1,
-			hash: leaf_b_hash,
-			para_data: vec![(
-				para_id,
-				PerParaData::new(candidate_relay_parent_number + 1, para_head.clone()),
-			)],
-		};
-		activate_leaf_with_params(
-			&mut virtual_overseer,
-			&leaf_b,
-			&test_state,
-			AsyncBackingParams { allowed_ancestry_len: 0, max_candidate_depth: 0 },
-		)
-		.await;
-
-		get_backable_candidates(
-			&mut virtual_overseer,
-			&leaf_b,
-			para_id,
-			Ancestors::new(),
-			1,
-			vec![],
+			vec![BackableCandidateRef {
+				candidate_hash: candidate_hash_b,
+				scheduling_parent: leaf_b_hash,
+			}],
 		)
 		.await;
 
@@ -2676,7 +2907,7 @@ fn uses_ancestry_only_within_session() {
 	test_harness(|mut virtual_overseer| async move {
 		let number = 5;
 		let hash = Hash::repeat_byte(5);
-		let ancestry_len = 3;
+		let scheduling_lookahead = DEFAULT_SCHEDULING_LOOKAHEAD;
 		let session = 2;
 
 		let ancestry_hashes =
@@ -2692,25 +2923,6 @@ fn uses_ancestry_only_within_session() {
 			.await;
 
 		assert_matches!(
-		virtual_overseer.recv().await,
-		AllMessages::RuntimeApi(
-			RuntimeApiMessage::Request(
-				parent,
-				RuntimeApiRequest::AsyncBackingParams(tx)
-			)) if parent == hash => {
-				tx.send(Ok(AsyncBackingParams { max_candidate_depth: 0, allowed_ancestry_len: ancestry_len})).unwrap();
-		});
-
-		assert_matches!(
-			virtual_overseer.recv().await,
-			AllMessages::RuntimeApi(
-				RuntimeApiMessage::Request(parent, RuntimeApiRequest::Version(tx))
-			) if parent == hash => {
-				tx.send(Ok(RuntimeApiRequest::CLAIM_QUEUE_RUNTIME_REQUIREMENT)).unwrap();
-			}
-		);
-
-		assert_matches!(
 			virtual_overseer.recv().await,
 			AllMessages::RuntimeApi(
 				RuntimeApiMessage::Request(parent, RuntimeApiRequest::ClaimQueue(tx))
@@ -2723,19 +2935,28 @@ fn uses_ancestry_only_within_session() {
 
 		assert_matches!(
 			virtual_overseer.recv().await,
-			AllMessages::ChainApi(
-				ChainApiMessage::Ancestors{hash: block_hash, k, response_channel: tx}
-			) if block_hash == hash && k == ancestry_len as usize => {
-				tx.send(Ok(ancestry_hashes.clone())).unwrap();
+			AllMessages::RuntimeApi(
+				RuntimeApiMessage::Request(parent, RuntimeApiRequest::SessionIndexForChild(tx))
+			) if parent == hash => {
+				tx.send(Ok(session)).unwrap();
 			}
 		);
 
 		assert_matches!(
 			virtual_overseer.recv().await,
 			AllMessages::RuntimeApi(
-				RuntimeApiMessage::Request(parent, RuntimeApiRequest::SessionIndexForChild(tx))
-			) if parent == hash => {
-				tx.send(Ok(session)).unwrap();
+				RuntimeApiMessage::Request(parent, RuntimeApiRequest::SchedulingLookahead(session_index, tx))
+			) if parent == hash && session_index == session => {
+				tx.send(Ok(scheduling_lookahead)).unwrap();
+			}
+		);
+
+		assert_matches!(
+			virtual_overseer.recv().await,
+			AllMessages::ChainApi(
+				ChainApiMessage::Ancestors{hash: block_hash, k, response_channel: tx}
+			) if block_hash == hash && k == (scheduling_lookahead - 1) as usize => {
+				tx.send(Ok(ancestry_hashes.clone())).unwrap();
 			}
 		);
 

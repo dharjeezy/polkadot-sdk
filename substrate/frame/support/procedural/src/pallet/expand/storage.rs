@@ -17,6 +17,7 @@
 
 use crate::{
 	counter_prefix,
+	deprecation::extract_or_return_allow_attrs,
 	pallet::{
 		parse::{
 			helper::two128_str,
@@ -101,7 +102,6 @@ pub struct ResultOnEmptyStructMetadata {
 	pub span: proc_macro2::Span,
 }
 
-///
 /// * if generics are unnamed: replace the first generic `_` by the generated prefix structure
 /// * if generics are named: reorder the generic, remove their name, and add the missing ones.
 /// * Add `#[allow(type_alias_bounds)]`
@@ -379,7 +379,6 @@ fn augment_final_docs(def: &mut Def) {
 	});
 }
 
-///
 /// * generate StoragePrefix structs (e.g. for a storage `MyStorage` a struct with the name
 ///   `_GeneratedPrefixForStorage$NameOfStorage` is generated) and implements StorageInstance trait.
 /// * if generics are unnamed: replace the first generic `_` by the generated prefix structure
@@ -425,17 +424,25 @@ pub fn expand_storages(def: &mut Def) -> proc_macro2::TokenStream {
 			Ok(deprecation) => deprecation,
 			Err(e) => return e.into_compile_error(),
 		};
+
+		// Extracts #[allow] attributes, necessary so that we don't run into compiler warnings
+		let maybe_allow_attrs: Vec<syn::Attribute> =
+			extract_or_return_allow_attrs(&storage.attrs).collect();
+
 		entries_builder.push(quote::quote_spanned!(storage.attr_span =>
 			#(#cfg_attrs)*
-			{
-				<#full_ident as #frame_support::storage::StorageEntryMetadataBuilder>::build_metadata(
-					#deprecation,
-					#frame_support::__private::vec![
-						#( #docs, )*
-					],
-					&mut entries,
-				);
-			}
+			#(#maybe_allow_attrs)*
+			(|entries: &mut #frame_support::__private::Vec<_>| {
+				{
+					<#full_ident as #frame_support::storage::StorageEntryMetadataBuilder>::build_metadata(
+						#deprecation,
+						#frame_support::__private::vec![
+							#( #docs, )*
+						],
+						entries,
+					);
+				}
+			})
 		))
 	}
 
@@ -443,7 +450,9 @@ pub fn expand_storages(def: &mut Def) -> proc_macro2::TokenStream {
 		if let Some(getter) = &storage.getter {
 			let completed_where_clause =
 				super::merge_where_clauses(&[&storage.where_clause, &def.config.where_clause]);
-
+			// Extracts #[allow] attributes, necessary so that we don't run into compiler warnings
+			let maybe_allow_attrs: Vec<syn::Attribute> =
+				extract_or_return_allow_attrs(&storage.attrs).collect();
 			let ident = &storage.ident;
 			let gen = &def.type_use_generics(storage.attr_span);
 			let type_impl_gen = &def.type_impl_generics(storage.attr_span);
@@ -479,6 +488,7 @@ pub fn expand_storages(def: &mut Def) -> proc_macro2::TokenStream {
 						#(#cfg_attrs)*
 						impl<#type_impl_gen> #pallet_ident<#type_use_gen> #completed_where_clause {
 							#[doc = #getter_doc_line]
+							#(#maybe_allow_attrs)*
 							pub fn #getter() -> #query {
 								<
 									#full_ident as #frame_support::storage::StorageValue<#value>
@@ -503,6 +513,7 @@ pub fn expand_storages(def: &mut Def) -> proc_macro2::TokenStream {
 						#(#cfg_attrs)*
 						impl<#type_impl_gen> #pallet_ident<#type_use_gen> #completed_where_clause {
 							#[doc = #getter_doc_line]
+							#(#maybe_allow_attrs)*
 							pub fn #getter<KArg>(k: KArg) -> #query where
 								KArg: #frame_support::__private::codec::EncodeLike<#key>,
 							{
@@ -529,6 +540,7 @@ pub fn expand_storages(def: &mut Def) -> proc_macro2::TokenStream {
 						#(#cfg_attrs)*
 						impl<#type_impl_gen> #pallet_ident<#type_use_gen> #completed_where_clause {
 							#[doc = #getter_doc_line]
+							#(#maybe_allow_attrs)*
 							pub fn #getter<KArg>(k: KArg) -> #query where
 								KArg: #frame_support::__private::codec::EncodeLike<#key>,
 							{
@@ -555,6 +567,7 @@ pub fn expand_storages(def: &mut Def) -> proc_macro2::TokenStream {
 						#(#cfg_attrs)*
 						impl<#type_impl_gen> #pallet_ident<#type_use_gen> #completed_where_clause {
 							#[doc = #getter_doc_line]
+							#(#maybe_allow_attrs)*
 							pub fn #getter<KArg1, KArg2>(k1: KArg1, k2: KArg2) -> #query where
 								KArg1: #frame_support::__private::codec::EncodeLike<#key1>,
 								KArg2: #frame_support::__private::codec::EncodeLike<#key2>,
@@ -583,6 +596,7 @@ pub fn expand_storages(def: &mut Def) -> proc_macro2::TokenStream {
 						#(#cfg_attrs)*
 						impl<#type_impl_gen> #pallet_ident<#type_use_gen> #completed_where_clause {
 							#[doc = #getter_doc_line]
+							#(#maybe_allow_attrs)*
 							pub fn #getter<KArg>(key: KArg) -> #query
 							where
 								KArg: #frame_support::storage::types::EncodeLikeTuple<
@@ -614,6 +628,7 @@ pub fn expand_storages(def: &mut Def) -> proc_macro2::TokenStream {
 						#(#cfg_attrs)*
 						impl<#type_impl_gen> #pallet_ident<#type_use_gen> #completed_where_clause {
 							#[doc = #getter_doc_line]
+							#(#maybe_allow_attrs)*
 							pub fn #getter<KArg>(key: KArg) -> #query
 							where
 								KArg: #frame_support::storage::types::EncodeLikeTuple<
@@ -822,6 +837,7 @@ pub fn expand_storages(def: &mut Def) -> proc_macro2::TokenStream {
 				for #name
 				#config_where_clause
 			{
+				#[allow(deprecated)]
 				fn get() -> Result<#value_ty, #error_path> {
 					Err(<#error_path>::#variant_name)
 				}
@@ -857,6 +873,7 @@ pub fn expand_storages(def: &mut Def) -> proc_macro2::TokenStream {
 
 		quote::quote!(
 			#frame_support::try_runtime_enabled! {
+				#[allow(deprecated)]
 				impl<#type_impl_gen> #frame_support::traits::TryDecodeEntireStorage
 				for #pallet_ident<#type_use_gen> #completed_where_clause
 				{
@@ -911,7 +928,7 @@ pub fn expand_storages(def: &mut Def) -> proc_macro2::TokenStream {
 					entries: {
 						#[allow(unused_mut)]
 						let mut entries = #frame_support::__private::vec![];
-						#( #entries_builder )*
+						#( #entries_builder(&mut entries); )*
 						entries
 					},
 				}

@@ -18,9 +18,22 @@
 
 use std::collections::HashSet;
 
-use crate::*;
-use frame_support::traits::WhitelistedStorageKeys;
-use sp_core::hexdisplay::HexDisplay;
+use crate::{xcm_config::LocationConverter, *};
+use approx::assert_relative_eq;
+use frame_support::{
+	assert_ok,
+	traits::{
+		fungible::{Inspect, Mutate},
+		WhitelistedStorageKeys,
+	},
+};
+use pallet_staking::EraPayout;
+use sp_core::{crypto::Ss58Codec, hexdisplay::HexDisplay};
+use sp_keyring::Sr25519Keyring::{self, Alice};
+use sp_runtime::generic::Era;
+use xcm_runtime_apis::conversions::LocationToAccountHelper;
+
+const MILLISECONDS_PER_HOUR: u64 = 60 * 60 * 1000;
 
 #[test]
 fn remove_keys_weight_is_sensible() {
@@ -62,7 +75,7 @@ fn sanity_check_teleport_assets_weight() {
 		weight_limit: Unlimited,
 	}
 	.get_dispatch_info()
-	.weight;
+	.call_weight;
 
 	assert!((weight * 50).all_lt(BlockWeights::get().max_block));
 }
@@ -103,10 +116,9 @@ fn check_treasury_pallet_id() {
 #[cfg(all(test, feature = "try-runtime"))]
 mod remote_tests {
 	use super::*;
+	use frame_support::traits::{TryState, TryStateSelect::All};
 	use frame_try_runtime::{runtime_decl_for_try_runtime::TryRuntime, UpgradeCheckSelect};
-	use remote_externalities::{
-		Builder, Mode, OfflineConfig, OnlineConfig, SnapshotConfig, Transport,
-	};
+	use remote_externalities::{Builder, Mode, OfflineConfig, OnlineConfig, SnapshotConfig};
 	use std::env::var;
 
 	#[tokio::test]
@@ -116,21 +128,23 @@ mod remote_tests {
 		}
 
 		sp_tracing::try_init_simple();
-		let transport: Transport =
-			var("WS").unwrap_or("wss://westend-rpc.polkadot.io:443".to_string()).into();
+		let transport_uri = var("WS").unwrap_or("wss://westend-rpc.polkadot.io:443".to_string());
 		let maybe_state_snapshot: Option<SnapshotConfig> = var("SNAP").map(|s| s.into()).ok();
 		let mut ext = Builder::<Block>::default()
 			.mode(if let Some(state_snapshot) = maybe_state_snapshot {
 				Mode::OfflineOrElseOnline(
 					OfflineConfig { state_snapshot: state_snapshot.clone() },
 					OnlineConfig {
-						transport,
+						transport_uris: vec![transport_uri.clone()],
 						state_snapshot: Some(state_snapshot),
 						..Default::default()
 					},
 				)
 			} else {
-				Mode::Online(OnlineConfig { transport, ..Default::default() })
+				Mode::Online(OnlineConfig {
+					transport_uris: vec![transport_uri],
+					..Default::default()
+				})
 			})
 			.build()
 			.await
@@ -147,27 +161,29 @@ mod remote_tests {
 		use frame_support::assert_ok;
 		sp_tracing::try_init_simple();
 
-		let transport: Transport = var("WS").unwrap_or("ws://127.0.0.1:9900".to_string()).into();
+		let transport_uri = var("WS").unwrap_or("ws://127.0.0.1:9900".to_string());
 		let maybe_state_snapshot: Option<SnapshotConfig> = var("SNAP").map(|s| s.into()).ok();
+		let online_config = OnlineConfig {
+			transport_uris: vec![transport_uri],
+			state_snapshot: maybe_state_snapshot.clone(),
+			child_trie: false,
+			pallets: vec![
+				"Staking".into(),
+				"System".into(),
+				"Balances".into(),
+				"NominationPools".into(),
+				"DelegatedStaking".into(),
+			],
+			..Default::default()
+		};
 		let mut ext = Builder::<Block>::default()
 			.mode(if let Some(state_snapshot) = maybe_state_snapshot {
 				Mode::OfflineOrElseOnline(
 					OfflineConfig { state_snapshot: state_snapshot.clone() },
-					OnlineConfig {
-						transport,
-						state_snapshot: Some(state_snapshot),
-						pallets: vec![
-							"staking".into(),
-							"system".into(),
-							"balances".into(),
-							"nomination-pools".into(),
-							"delegated-staking".into(),
-						],
-						..Default::default()
-					},
+					online_config,
 				)
 			} else {
-				Mode::Online(OnlineConfig { transport, ..Default::default() })
+				Mode::Online(online_config)
 			})
 			.build()
 			.await
@@ -234,5 +250,354 @@ mod remote_tests {
 				unexpected_errors
 			);
 		});
+
+		ext.execute_with(|| {
+			AllPalletsWithSystem::try_state(System::block_number(), All).unwrap();
+		});
 	}
+
+	#[tokio::test]
+	async fn staking_curr_fun_migrate() {
+		// Intended to be run only manually.
+		if var("RUN_MIGRATION_TESTS").is_err() {
+			return;
+		}
+		sp_tracing::try_init_simple();
+
+		let transport_uri = var("WS").unwrap_or("ws://127.0.0.1:9944".to_string());
+		let maybe_state_snapshot: Option<SnapshotConfig> = var("SNAP").map(|s| s.into()).ok();
+		let online_config = OnlineConfig {
+			transport_uris: vec![transport_uri],
+			state_snapshot: maybe_state_snapshot.clone(),
+			child_trie: false,
+			pallets: vec![
+				"Staking".into(),
+				"System".into(),
+				"Balances".into(),
+				"NominationPools".into(),
+				"DelegatedStaking".into(),
+				"VoterList".into(),
+			],
+			..Default::default()
+		};
+		let mut ext = Builder::<Block>::default()
+			.mode(if let Some(state_snapshot) = maybe_state_snapshot {
+				Mode::OfflineOrElseOnline(
+					OfflineConfig { state_snapshot: state_snapshot.clone() },
+					online_config,
+				)
+			} else {
+				Mode::Online(online_config)
+			})
+			.build()
+			.await
+			.unwrap();
+		ext.execute_with(|| {
+			// create an account with some balance
+			let alice = AccountId::from([1u8; 32]);
+			use frame_support::traits::Currency;
+			let _ = Balances::deposit_creating(&alice, 100_000 * UNITS);
+
+			let mut success = 0;
+			let mut err = 0;
+			let mut no_migration_needed = 0;
+			let mut force_withdraw_acc = 0;
+			let mut force_withdraw_count = 0;
+			let mut max_force_withdraw = 0;
+			// iterate over all stakers
+			pallet_staking::Ledger::<Runtime>::iter().for_each(|(ctrl, ledger)| {
+				match pallet_staking::Pallet::<Runtime>::migrate_currency(
+					RuntimeOrigin::signed(alice.clone()).into(),
+					ledger.stash.clone(),
+				) {
+					Ok(_) => {
+						let updated_ledger =
+							pallet_staking::Ledger::<Runtime>::get(&ctrl).expect("ledger exists");
+						let force_withdraw = ledger.total - updated_ledger.total;
+						if force_withdraw > 0 {
+							force_withdraw_acc += force_withdraw;
+							force_withdraw_count += 1;
+							max_force_withdraw = max_force_withdraw.max(force_withdraw);
+							log::debug!(target: "remote_test", "Force withdraw from stash {:?}: value {:?}", ledger.stash, force_withdraw);
+						}
+						success += 1;
+					},
+					Err(e) => {
+						if e == pallet_staking::Error::<Runtime>::AlreadyMigrated.into() {
+							no_migration_needed += 1;
+						} else {
+							log::error!(target: "remote_test", "Error migrating {:?}: {:?}", ledger.stash, e);
+							err += 1;
+						}
+					},
+				}
+			});
+
+			log::info!(
+				target: "remote_test",
+				"Migration stats: success: {}, err: {}, total force withdrawn stake: {}, count {}, maximum amount {}, no_migration_needed: {}",
+				success,
+				err,
+				force_withdraw_acc,
+				force_withdraw_count,
+				max_force_withdraw,
+				no_migration_needed
+			);
+		});
+
+		ext.execute_with(|| {
+			AllPalletsWithSystem::try_state(System::block_number(), All).unwrap();
+		});
+	}
+}
+
+#[test]
+fn location_conversion_works() {
+	// the purpose of hardcoded values is to catch an unintended location conversion logic change.
+	struct TestCase {
+		description: &'static str,
+		location: Location,
+		expected_account_id_str: &'static str,
+	}
+
+	let test_cases = vec![
+		// DescribeTerminus
+		TestCase {
+			description: "DescribeTerminus Child",
+			location: Location::new(0, [Parachain(1111)]),
+			expected_account_id_str: "5Ec4AhP4h37t7TFsAZ4HhFq6k92usAAJDUC3ADSZ4H4Acru3",
+		},
+		// DescribePalletTerminal
+		TestCase {
+			description: "DescribePalletTerminal Child",
+			location: Location::new(0, [Parachain(1111), PalletInstance(50)]),
+			expected_account_id_str: "5FjEBrKn3STAFsZpQF4jzwxUYHNGnNgzdZqSQfTzeJ82XKp6",
+		},
+		// DescribeAccountId32Terminal
+		TestCase {
+			description: "DescribeAccountId32Terminal Child",
+			location: Location::new(
+				0,
+				[Parachain(1111), AccountId32 { network: None, id: AccountId::from(Alice).into() }],
+			),
+			expected_account_id_str: "5EEMro9RRDpne4jn9TuD7cTB6Amv1raVZ3xspSkqb2BF3FJH",
+		},
+		// DescribeAccountKey20Terminal
+		TestCase {
+			description: "DescribeAccountKey20Terminal Child",
+			location: Location::new(
+				0,
+				[Parachain(1111), AccountKey20 { network: None, key: [0u8; 20] }],
+			),
+			expected_account_id_str: "5HohjXdjs6afcYcgHHSstkrtGfxgfGKsnZ1jtewBpFiGu4DL",
+		},
+		// DescribeTreasuryVoiceTerminal
+		TestCase {
+			description: "DescribeTreasuryVoiceTerminal Child",
+			location: Location::new(
+				0,
+				[Parachain(1111), Plurality { id: BodyId::Treasury, part: BodyPart::Voice }],
+			),
+			expected_account_id_str: "5GenE4vJgHvwYVcD6b4nBvH5HNY4pzpVHWoqwFpNMFT7a2oX",
+		},
+		// DescribeBodyTerminal
+		TestCase {
+			description: "DescribeBodyTerminal Child",
+			location: Location::new(
+				0,
+				[Parachain(1111), Plurality { id: BodyId::Unit, part: BodyPart::Voice }],
+			),
+			expected_account_id_str: "5DPgGBFTTYm1dGbtB1VWHJ3T3ScvdrskGGx6vSJZNP1WNStV",
+		},
+	];
+
+	for tc in test_cases {
+		let expected =
+			AccountId::from_string(tc.expected_account_id_str).expect("Invalid AccountId string");
+
+		let got = LocationToAccountHelper::<AccountId, LocationConverter>::convert_location(
+			tc.location.into(),
+		)
+		.unwrap();
+
+		assert_eq!(got, expected, "{}", tc.description);
+	}
+}
+
+#[test]
+fn staking_inflation_correct_single_era() {
+	let (to_stakers, to_treasury) = super::EraPayout::era_payout(
+		123, // ignored
+		456, // ignored
+		MILLISECONDS_PER_HOUR,
+	);
+
+	assert_relative_eq!(to_stakers as f64, (4_046 * CENTS) as f64, max_relative = 0.01);
+	assert_relative_eq!(to_treasury as f64, (714 * CENTS) as f64, max_relative = 0.01);
+	// Total per hour is ~47.6 WND
+	assert_relative_eq!(
+		(to_stakers as f64 + to_treasury as f64),
+		(4_760 * CENTS) as f64,
+		max_relative = 0.001
+	);
+}
+
+#[test]
+fn staking_inflation_correct_longer_era() {
+	// Twice the era duration means twice the emission:
+	let (to_stakers, to_treasury) = super::EraPayout::era_payout(
+		123, // ignored
+		456, // ignored
+		2 * MILLISECONDS_PER_HOUR,
+	);
+
+	assert_relative_eq!(to_stakers as f64, (4_046 * CENTS) as f64 * 2.0, max_relative = 0.001);
+	assert_relative_eq!(to_treasury as f64, (714 * CENTS) as f64 * 2.0, max_relative = 0.001);
+}
+
+#[test]
+fn staking_inflation_correct_whole_year() {
+	let (to_stakers, to_treasury) = super::EraPayout::era_payout(
+		123,                                        // ignored
+		456,                                        // ignored
+		(36525 * 24 * MILLISECONDS_PER_HOUR) / 100, // 1 year
+	);
+
+	// Our yearly emissions is about 417k WND:
+	let yearly_emission = 417_307 * UNITS;
+	assert_relative_eq!(
+		to_stakers as f64 + to_treasury as f64,
+		yearly_emission as f64,
+		max_relative = 0.001
+	);
+
+	assert_relative_eq!(to_stakers as f64, yearly_emission as f64 * 0.85, max_relative = 0.001);
+	assert_relative_eq!(to_treasury as f64, yearly_emission as f64 * 0.15, max_relative = 0.001);
+}
+
+// 10 years into the future, our values do not overflow.
+#[test]
+fn staking_inflation_correct_not_overflow() {
+	let (to_stakers, to_treasury) = super::EraPayout::era_payout(
+		123,                                       // ignored
+		456,                                       // ignored
+		(36525 * 24 * MILLISECONDS_PER_HOUR) / 10, // 10 years
+	);
+	let initial_ti: i128 = 5_216_342_402_773_185_773;
+	let projected_total_issuance = (to_stakers as i128 + to_treasury as i128) + initial_ti;
+
+	// In 2034, there will be about 9.39 million WND in existence.
+	assert_relative_eq!(
+		projected_total_issuance as f64,
+		(9_390_000 * UNITS) as f64,
+		max_relative = 0.001
+	);
+}
+
+// Print percent per year, just as convenience.
+#[test]
+fn staking_inflation_correct_print_percent() {
+	let (to_stakers, to_treasury) = super::EraPayout::era_payout(
+		123,                                        // ignored
+		456,                                        // ignored
+		(36525 * 24 * MILLISECONDS_PER_HOUR) / 100, // 1 year
+	);
+	let yearly_emission = to_stakers + to_treasury;
+	let mut ti: i128 = 5_216_342_402_773_185_773;
+
+	for y in 0..10 {
+		let new_ti = ti + yearly_emission as i128;
+		let inflation = 100.0 * (new_ti - ti) as f64 / ti as f64;
+		println!("Year {y} inflation: {inflation}%");
+		ti = new_ti;
+
+		assert!(inflation <= 8.0 && inflation > 2.0, "sanity check");
+	}
+}
+
+fn new_test_ext() -> sp_io::TestExternalities {
+	frame_system::GenesisConfig::<Runtime>::default()
+		.build_storage()
+		.unwrap()
+		.into()
+}
+
+fn construct_extrinsic(sender: Sr25519Keyring, call: RuntimeCall) -> UncheckedExtrinsic {
+	let account_id = AccountId::from(sender);
+	let tx_ext: TxExtension = (
+		frame_system::AuthorizeCall::<Runtime>::new(),
+		frame_system::CheckNonZeroSender::<Runtime>::new(),
+		frame_system::CheckSpecVersion::<Runtime>::new(),
+		frame_system::CheckTxVersion::<Runtime>::new(),
+		frame_system::CheckGenesis::<Runtime>::new(),
+		frame_system::CheckMortality::from(Era::immortal()),
+		frame_system::CheckNonce::<Runtime>::from(
+			frame_system::Pallet::<Runtime>::account(&account_id).nonce,
+		),
+		frame_system::CheckWeight::<Runtime>::new(),
+		pallet_transaction_payment::ChargeTransactionPayment::<Runtime>::from(0),
+		frame_metadata_hash_extension::CheckMetadataHash::new(false),
+		frame_system::WeightReclaim::<Runtime>::new(),
+	);
+	let payload = sp_runtime::generic::SignedPayload::new(call.clone(), tx_ext.clone()).unwrap();
+	let signature = payload.using_encoded(|e| sender.sign(e));
+	UncheckedExtrinsic::new_signed(call, account_id.into(), Signature::Sr25519(signature), tx_ext)
+}
+
+#[test]
+fn tx_fees_go_to_dap_satellite() {
+	new_test_ext().execute_with(|| {
+		let alice = AccountId::from(Sr25519Keyring::Alice);
+		let satellite = pallet_dap_satellite::Pallet::<Runtime>::satellite_account();
+		let ed = ExistentialDeposit::get();
+
+		assert_ok!(<Balances as Mutate<AccountId>>::mint_into(&alice, 100 * ed));
+		assert_ok!(<Balances as Mutate<AccountId>>::mint_into(&satellite, ed));
+
+		let alice_before = <Balances as Inspect<AccountId>>::balance(&alice);
+		let satellite_before = <Balances as Inspect<AccountId>>::balance(&satellite);
+		let issuance_before = <Balances as Inspect<AccountId>>::total_issuance();
+
+		let call = RuntimeCall::System(frame_system::Call::remark { remark: vec![] });
+		let xt = construct_extrinsic(Sr25519Keyring::Alice, call);
+		assert_ok!(Executive::apply_extrinsic(xt).unwrap());
+
+		let alice_after = <Balances as Inspect<AccountId>>::balance(&alice);
+		let fee_paid = alice_before - alice_after;
+		assert!(fee_paid > 0, "a fee should have been paid");
+
+		let satellite_after = <Balances as Inspect<AccountId>>::balance(&satellite);
+		let issuance_after = <Balances as Inspect<AccountId>>::total_issuance();
+
+		assert_eq!(satellite_after, satellite_before + fee_paid);
+		assert_eq!(issuance_before, issuance_after);
+	});
+}
+
+#[test]
+fn dust_removal_goes_to_dap_satellite() {
+	new_test_ext().execute_with(|| {
+		let alice: AccountId = Sr25519Keyring::Alice.into();
+		let bob: AccountId = Sr25519Keyring::Bob.into();
+		let satellite = pallet_dap_satellite::Pallet::<Runtime>::satellite_account();
+		let ed = ExistentialDeposit::get();
+		let dust = ed / 2;
+
+		assert_ok!(<Balances as Mutate<AccountId>>::mint_into(&bob, ed + dust));
+		assert_ok!(<Balances as Mutate<AccountId>>::mint_into(&alice, 100 * ed));
+		assert_ok!(<Balances as Mutate<AccountId>>::mint_into(&satellite, ed));
+
+		let satellite_before = <Balances as Inspect<AccountId>>::balance(&satellite);
+
+		// Transfer ED away from bob, leaving dust < ED → account reaped.
+		assert_ok!(Balances::transfer_allow_death(
+			RuntimeOrigin::signed(bob.clone()),
+			alice.into(),
+			ed,
+		));
+
+		let satellite_after = <Balances as Inspect<AccountId>>::balance(&satellite);
+		assert_eq!(satellite_after, satellite_before + dust);
+		assert_eq!(<Balances as Inspect<AccountId>>::balance(&bob), 0);
+	});
 }

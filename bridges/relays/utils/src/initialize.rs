@@ -30,7 +30,7 @@ use std::cell::RefCell;
 /// (get it with `option_env!("CARGO_PKG_VERSION")` from a binary package code).
 pub static RELAYER_VERSION: Mutex<Option<String>> = Mutex::new(None);
 
-async_std::task_local! {
+std::thread_local! {
 	pub(crate) static LOOP_NAME: RefCell<String> = RefCell::new(String::default());
 }
 
@@ -52,9 +52,10 @@ pub fn initialize_logger(with_timestamp: bool) {
 		format,
 	);
 
-	let env_filter = EnvFilter::from_default_env()
-		.add_directive(Level::WARN.into())
-		.add_directive("bridge=info".parse().expect("static filter string is valid"));
+	let env_filter = EnvFilter::builder()
+		.with_default_directive(Level::WARN.into())
+		.with_default_directive("bridge=info".parse().expect("static filter string is valid"))
+		.from_env_lossy();
 
 	let builder = SubscriberBuilder::default().with_env_filter(env_filter);
 

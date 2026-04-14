@@ -17,20 +17,19 @@
 //! Mocks for all the traits.
 
 use crate::{
-	assigner_coretime, assigner_parachains, configuration, coretime, disputes, dmp, hrmp,
+	configuration, coretime, disputes, dmp, hrmp,
 	inclusion::{self, AggregateMessageOrigin, UmpQueueId},
 	initializer, on_demand, origin, paras,
 	paras::ParaKind,
-	paras_inherent, scheduler,
-	scheduler::common::AssignmentProvider,
-	session_info, shared, ParaId,
+	paras_inherent, scheduler, session_info, shared, ParaId,
 };
 use frame_support::pallet_prelude::*;
-use polkadot_primitives::CoreIndex;
 
 use codec::Decode;
 use frame_support::{
-	assert_ok, derive_impl, parameter_types,
+	assert_ok, derive_impl,
+	dispatch::GetDispatchInfo,
+	parameter_types,
 	traits::{
 		Currency, ProcessMessage, ProcessMessageError, ValidatorSet, ValidatorSetWithIdentification,
 	},
@@ -38,7 +37,7 @@ use frame_support::{
 	PalletId,
 };
 use frame_support_test::TestRandomness;
-use frame_system::limits;
+use frame_system::{limits, EnsureRoot};
 use polkadot_primitives::{
 	AuthorityDiscoveryId, Balance, BlockNumber, CandidateHash, Moment, SessionIndex, UpwardMessage,
 	ValidationCode, ValidatorIndex,
@@ -52,11 +51,11 @@ use sp_runtime::{
 };
 use std::{
 	cell::RefCell,
-	collections::{btree_map::BTreeMap, vec_deque::VecDeque, HashMap},
+	collections::{btree_map::BTreeMap, HashMap},
 };
 use xcm::{
 	prelude::XcmVersion,
-	v4::{Assets, InteriorLocation, Location, SendError, SendResult, SendXcm, Xcm, XcmHash},
+	v5::{Assets, InteriorLocation, Location, SendError, SendResult, SendXcm, Xcm, XcmHash},
 	IntoVersion, VersionedXcm, WrapVersion,
 };
 
@@ -75,10 +74,7 @@ frame_support::construct_runtime!(
 		ParaInclusion: inclusion,
 		ParaInherent: paras_inherent,
 		Scheduler: scheduler,
-		MockAssigner: mock_assigner,
-		ParachainsAssigner: assigner_parachains,
 		OnDemand: on_demand,
-		CoretimeAssigner: assigner_coretime,
 		Coretime: coretime,
 		Initializer: initializer,
 		Dmp: dmp,
@@ -90,12 +86,21 @@ frame_support::construct_runtime!(
 	}
 );
 
-impl<C> frame_system::offchain::SendTransactionTypes<C> for Test
+impl<C> frame_system::offchain::CreateTransactionBase<C> for Test
 where
 	RuntimeCall: From<C>,
 {
 	type Extrinsic = UncheckedExtrinsic;
-	type OverarchingCall = RuntimeCall;
+	type RuntimeCall = RuntimeCall;
+}
+
+impl<C> frame_system::offchain::CreateBare<C> for Test
+where
+	RuntimeCall: From<C>,
+{
+	fn create_bare(call: Self::RuntimeCall) -> Self::Extrinsic {
+		UncheckedExtrinsic::new_bare(call)
+	}
 }
 
 parameter_types! {
@@ -103,7 +108,12 @@ parameter_types! {
 		frame_system::limits::BlockWeights::simple_max(
 			Weight::from_parts(4 * 1024 * 1024, u64::MAX),
 		);
-	pub static BlockLength: limits::BlockLength = limits::BlockLength::max_with_normal_ratio(u32::MAX, Perbill::from_percent(75));
+	pub static BlockLength: limits::BlockLength = limits::BlockLength::builder()
+		.max_length(u32::MAX)
+		.modify_max_length_for_class(frame_support::dispatch::DispatchClass::Normal, |m| {
+			*m = Perbill::from_percent(75) * u32::MAX
+		})
+		.build();
 }
 
 pub type AccountId = u64;
@@ -237,6 +247,9 @@ impl crate::paras::Config for Test {
 	type NextSessionRotation = TestNextSessionRotation;
 	type OnNewHead = ();
 	type AssignCoretime = ();
+	type Fungible = Balances;
+	type CooldownRemovalMultiplier = ConstUint<1>;
+	type AuthorizeCurrentCodeOrigin = EnsureRoot<AccountId>;
 }
 
 impl crate::dmp::Config for Test {}
@@ -252,13 +265,13 @@ thread_local! {
 /// versions in the `VERSION_WRAPPER`.
 pub struct TestUsesOnlyStoredVersionWrapper;
 impl WrapVersion for TestUsesOnlyStoredVersionWrapper {
-	fn wrap_version<RuntimeCall>(
+	fn wrap_version<RuntimeCall: Decode + GetDispatchInfo>(
 		dest: &Location,
 		xcm: impl Into<VersionedXcm<RuntimeCall>>,
 	) -> Result<VersionedXcm<RuntimeCall>, ()> {
 		match VERSION_WRAPPER.with(|r| r.borrow().get(dest).map_or(None, |v| *v)) {
 			Some(v) => xcm.into().into_version(v),
-			None => return Err(()),
+			None => Err(()),
 		}
 	}
 }
@@ -334,9 +347,7 @@ impl crate::disputes::SlashingHandler<BlockNumber> for Test {
 	fn initializer_on_new_session(_: SessionIndex) {}
 }
 
-impl crate::scheduler::Config for Test {
-	type AssignmentProvider = MockAssigner;
-}
+impl crate::scheduler::Config for Test {}
 
 pub struct TestMessageQueueWeight;
 impl pallet_message_queue::WeightInfo for TestMessageQueueWeight {
@@ -356,6 +367,9 @@ impl pallet_message_queue::WeightInfo for TestMessageQueueWeight {
 		Weight::zero()
 	}
 	fn service_page_item() -> Weight {
+		Weight::zero()
+	}
+	fn set_service_head() -> Weight {
 		Weight::zero()
 	}
 	fn bump_service_head() -> Weight {
@@ -390,8 +404,6 @@ impl pallet_message_queue::Config for Test {
 	type IdleMaxServiceWeight = ();
 }
 
-impl assigner_parachains::Config for Test {}
-
 parameter_types! {
 	pub const OnDemandTrafficDefaultValue: FixedU128 = FixedU128::from_u32(1);
 	// Production chains should keep this numbar around twice the
@@ -409,8 +421,6 @@ impl on_demand::Config for Test {
 	type PalletId = OnDemandPalletId;
 }
 
-impl assigner_coretime::Config for Test {}
-
 parameter_types! {
 	pub const BrokerId: u32 = 10u32;
 	pub MaxXcmTransactWeight: Weight = Weight::from_parts(10_000_000, 10_000);
@@ -426,7 +436,6 @@ impl Get<InteriorLocation> for BrokerPot {
 impl coretime::Config for Test {
 	type RuntimeOrigin = RuntimeOrigin;
 	type RuntimeEvent = RuntimeEvent;
-	type Currency = pallet_balances::Pallet<Test>;
 	type BrokerId = BrokerId;
 	type WeightInfo = crate::coretime::TestWeightInfo;
 	type SendXcm = DummyXcmSender;
@@ -486,83 +495,6 @@ impl ValidatorSetWithIdentification<AccountId> for MockValidatorSet {
 	type Identification = ();
 	type IdentificationOf = FoolIdentificationOf;
 }
-
-/// A mock assigner which acts as the scheduler's `AssignmentProvider` for tests. The mock
-/// assigner provides bare minimum functionality to test scheduler internals. Since they
-/// have no direct effect on scheduler state, AssignmentProvider functions such as
-/// `push_back_assignment` can be left empty.
-pub mod mock_assigner {
-	use crate::scheduler::common::Assignment;
-
-	use super::*;
-	pub use pallet::*;
-
-	#[frame_support::pallet]
-	pub mod pallet {
-		use super::*;
-
-		#[pallet::pallet]
-		#[pallet::without_storage_info]
-		pub struct Pallet<T>(_);
-
-		#[pallet::config]
-		pub trait Config: frame_system::Config + configuration::Config + paras::Config {}
-
-		#[pallet::storage]
-		pub(super) type MockAssignmentQueue<T: Config> =
-			StorageValue<_, VecDeque<Assignment>, ValueQuery>;
-
-		#[pallet::storage]
-		pub(super) type MockCoreCount<T: Config> = StorageValue<_, u32, OptionQuery>;
-	}
-
-	impl<T: Config> Pallet<T> {
-		/// Adds a claim to the `MockAssignmentQueue` this claim can later be popped by the
-		/// scheduler when filling the claim queue for tests.
-		pub fn add_test_assignment(assignment: Assignment) {
-			MockAssignmentQueue::<T>::mutate(|queue| queue.push_back(assignment));
-		}
-
-		// Allows for customized core count in scheduler tests, rather than a core count
-		// derived from on-demand config + parachain count.
-		pub fn set_core_count(count: u32) {
-			MockCoreCount::<T>::set(Some(count));
-		}
-	}
-
-	impl<T: Config> AssignmentProvider<BlockNumber> for Pallet<T> {
-		// With regards to popping_assignments, the scheduler just needs to be tested under
-		// the following two conditions:
-		// 1. An assignment is provided
-		// 2. No assignment is provided
-		// A simple assignment queue populated to fit each test fulfills these needs.
-		fn pop_assignment_for_core(_core_idx: CoreIndex) -> Option<Assignment> {
-			let mut queue: VecDeque<Assignment> = MockAssignmentQueue::<T>::get();
-			let front = queue.pop_front();
-			// Write changes to storage.
-			MockAssignmentQueue::<T>::set(queue);
-			front
-		}
-
-		// We don't care about core affinity in the test assigner
-		fn report_processed(_assignment: Assignment) {}
-
-		// The results of this are tested in on_demand tests. No need to represent it
-		// in the mock assigner.
-		fn push_back_assignment(_assignment: Assignment) {}
-
-		#[cfg(any(feature = "runtime-benchmarks", test))]
-		fn get_mock_assignment(_: CoreIndex, para_id: ParaId) -> Assignment {
-			Assignment::Bulk(para_id)
-		}
-
-		fn session_core_count() -> u32 {
-			MockCoreCount::<T>::get().unwrap_or(5)
-		}
-	}
-}
-
-impl mock_assigner::pallet::Config for Test {}
 
 pub struct FoolIdentificationOf;
 impl sp_runtime::traits::Convert<AccountId, Option<()>> for FoolIdentificationOf {
@@ -649,7 +581,7 @@ impl ProcessMessage for TestProcessMessage {
 			Err(_) => return Err(ProcessMessageError::Corrupt), // same as the real `ProcessMessage`
 		};
 		if meter.try_consume(required).is_err() {
-			return Err(ProcessMessageError::Overweight(required))
+			return Err(ProcessMessageError::Overweight(required));
 		}
 
 		let mut processed = Processed::get();

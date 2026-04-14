@@ -7,12 +7,16 @@ concurrency:
 on:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
+    paths:
+      - "cumulus/parachains/runtimes/*"
 
 # Jobs in this workflow depend on each other, only for limiting peak amount of spawned workers
 
 jobs:
-
+  isdraft:
+    uses: ./.github/workflows/reusable-isdraft.yml
   preflight:
+    needs: isdraft
     uses: ./.github/workflows/reusable-preflight.yml
 
   check-runtime-assets:
@@ -23,7 +27,7 @@ jobs:
       image: ${{ needs.preflight.outputs.IMAGE }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - name: Run cargo check
         uses: ./.github/actions/cargo-check-runtimes
         with:
@@ -37,7 +41,7 @@ jobs:
       image: ${{ needs.preflight.outputs.IMAGE }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - name: Run cargo check
         uses: ./.github/actions/cargo-check-runtimes
         with:
@@ -51,7 +55,7 @@ jobs:
     timeout-minutes: 20
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - name: Run cargo check
         uses: ./.github/actions/cargo-check-runtimes
         with:
@@ -65,7 +69,7 @@ jobs:
     timeout-minutes: 20
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - name: Run cargo check
         uses: ./.github/actions/cargo-check-runtimes
         with:
@@ -79,35 +83,21 @@ jobs:
     timeout-minutes: 20
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - name: Run cargo check
         uses: ./.github/actions/cargo-check-runtimes
         with:
           root: cumulus/parachains/runtimes/contracts
 
-  check-runtime-starters:
-    runs-on: ${{ needs.preflight.outputs.RUNNER }}
-    container:
-      image: ${{ needs.preflight.outputs.IMAGE }}
-    needs: [check-runtime-assets, preflight]
-    timeout-minutes: 20
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-      - name: Run cargo check
-        uses: ./.github/actions/cargo-check-runtimes
-        with:
-          root: cumulus/parachains/runtimes/starters
-
   check-runtime-testing:
     runs-on: ${{ needs.preflight.outputs.RUNNER }}
     container:
       image: ${{ needs.preflight.outputs.IMAGE }}
-    needs: [check-runtime-starters, preflight]
+    needs: [preflight]
     timeout-minutes: 20
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - name: Run cargo check
         uses: ./.github/actions/cargo-check-runtimes
         with:
@@ -123,13 +113,12 @@ jobs:
       - check-runtime-coretime
       - check-runtime-bridge-hubs
       - check-runtime-contracts
-      - check-runtime-starters
       - check-runtime-testing
     if: always() && !cancelled()
     steps:
       - run: |
           tee resultfile <<< '${{ toJSON(needs) }}'
-          FAILURES=$(cat resultfile | grep '"result": "failure"' | wc -l)
+          FAILURES=$(cat resultfile | grep -E '"result": "(failure|cancelled)"' | wc -l)
           if [ $FAILURES -gt 0 ]; then
             echo "### At least one required job failed ❌" >> $GITHUB_STEP_SUMMARY
             exit 1

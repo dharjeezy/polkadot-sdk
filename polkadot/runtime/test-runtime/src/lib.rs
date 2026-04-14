@@ -31,13 +31,15 @@ use codec::Encode;
 use pallet_transaction_payment::FungibleAdapter;
 
 use polkadot_runtime_parachains::{
-	assigner_parachains as parachains_assigner_parachains,
 	configuration as parachains_configuration,
-	configuration::ActiveConfigHrmpChannelSizeAndCapacityRatio, disputes as parachains_disputes,
-	disputes::slashing as parachains_slashing, dmp as parachains_dmp, hrmp as parachains_hrmp,
-	inclusion as parachains_inclusion, initializer as parachains_initializer,
+	configuration::ActiveConfigHrmpChannelSizeAndCapacityRatio,
+	coretime, disputes as parachains_disputes,
+	disputes::slashing as parachains_slashing,
+	dmp as parachains_dmp, hrmp as parachains_hrmp, inclusion as parachains_inclusion,
+	initializer as parachains_initializer, on_demand as parachains_on_demand,
 	origin as parachains_origin, paras as parachains_paras,
-	paras_inherent as parachains_paras_inherent, runtime_api_impl::v11 as runtime_impl,
+	paras_inherent as parachains_paras_inherent,
+	runtime_api_impl::{v13 as runtime_impl, vstaging as staging_runtime_impl},
 	scheduler as parachains_scheduler, session_info as parachains_session_info,
 	shared as parachains_shared,
 };
@@ -51,20 +53,18 @@ use frame_support::{
 	genesis_builder_helper::{build_state, get_preset},
 	parameter_types,
 	traits::{KeyOwnerProofSystem, WithdrawReasons},
+	PalletId,
 };
 use pallet_grandpa::{fg_primitives, AuthorityId as GrandpaId};
 use pallet_session::historical as session_historical;
 use pallet_timestamp::Now;
 use pallet_transaction_payment::{FeeDetails, RuntimeDispatchInfo};
 use polkadot_primitives::{
-	slashing,
-	vstaging::{
-		CandidateEvent, CommittedCandidateReceiptV2 as CommittedCandidateReceipt, CoreState,
-		ScrapedOnChainVotes,
-	},
-	AccountId, AccountIndex, Balance, BlockNumber, CandidateHash, CoreIndex, DisputeState,
-	ExecutorParams, GroupRotationInfo, Hash as HashT, Id as ParaId, InboundDownwardMessage,
-	InboundHrmpMessage, Moment, Nonce, OccupiedCoreAssumption, PersistedValidationData,
+	async_backing::Constraints, slashing, AccountId, AccountIndex, Balance, BlockNumber,
+	CandidateEvent, CandidateHash, CommittedCandidateReceiptV2 as CommittedCandidateReceipt,
+	CoreIndex, CoreState, DisputeState, ExecutorParams, GroupRotationInfo, Hash as HashT,
+	Id as ParaId, InboundDownwardMessage, InboundHrmpMessage, Moment, Nonce,
+	OccupiedCoreAssumption, PersistedValidationData, ScrapedOnChainVotes,
 	SessionInfo as SessionInfoData, Signature, ValidationCode, ValidationCodeHash, ValidatorId,
 	ValidatorIndex, PARACHAIN_KEY_TYPE_ID,
 };
@@ -75,15 +75,14 @@ use polkadot_runtime_common::{
 use polkadot_runtime_parachains::reward_points::RewardValidatorsWithEraPoints;
 use sp_authority_discovery::AuthorityId as AuthorityDiscoveryId;
 use sp_consensus_beefy::ecdsa_crypto::{AuthorityId as BeefyId, Signature as BeefySignature};
-use sp_core::{ConstU32, OpaqueMetadata};
+use sp_core::{ConstBool, ConstU32, ConstUint, Get, OpaqueMetadata};
 use sp_mmr_primitives as mmr;
 use sp_runtime::{
-	create_runtime_str,
 	curve::PiecewiseLinear,
 	generic, impl_opaque_keys,
 	traits::{
-		BlakeTwo256, Block as BlockT, ConvertInto, Extrinsic as ExtrinsicT, OpaqueKeys,
-		SaturatedConversion, StaticLookup, Verify,
+		BlakeTwo256, Block as BlockT, ConvertInto, OpaqueKeys, SaturatedConversion, StaticLookup,
+		Verify,
 	},
 	transaction_validity::{TransactionPriority, TransactionSource, TransactionValidity},
 	ApplyExtrinsicResult, FixedU128, KeyTypeId, Perbill, Percent,
@@ -92,6 +91,7 @@ use sp_staking::SessionIndex;
 #[cfg(any(feature = "std", test))]
 use sp_version::NativeVersion;
 use sp_version::RuntimeVersion;
+use xcm::latest::{Assets, InteriorLocation, Location, SendError, SendResult, SendXcm, XcmHash};
 
 pub use pallet_balances::Call as BalancesCall;
 #[cfg(feature = "std")]
@@ -116,8 +116,8 @@ include!(concat!(env!("OUT_DIR"), "/wasm_binary.rs"));
 /// Runtime version (Test).
 #[sp_version::runtime_version]
 pub const VERSION: RuntimeVersion = RuntimeVersion {
-	spec_name: create_runtime_str!("polkadot-test-runtime"),
-	impl_name: create_runtime_str!("parity-polkadot-test-runtime"),
+	spec_name: alloc::borrow::Cow::Borrowed("polkadot-test-runtime"),
+	impl_name: alloc::borrow::Cow::Borrowed("parity-polkadot-test-runtime"),
 	authoring_version: 2,
 	spec_version: 1056,
 	impl_version: 0,
@@ -167,12 +167,52 @@ impl frame_system::Config for Runtime {
 	type MaxConsumers = frame_support::traits::ConstU32<16>;
 }
 
-impl<C> frame_system::offchain::SendTransactionTypes<C> for Runtime
+impl<C> frame_system::offchain::CreateTransactionBase<C> for Runtime
 where
 	RuntimeCall: From<C>,
 {
-	type OverarchingCall = RuntimeCall;
+	type RuntimeCall = RuntimeCall;
 	type Extrinsic = UncheckedExtrinsic;
+}
+
+impl<C> frame_system::offchain::CreateBare<C> for Runtime
+where
+	RuntimeCall: From<C>,
+{
+	fn create_bare(call: Self::RuntimeCall) -> Self::Extrinsic {
+		UncheckedExtrinsic::new_bare(call)
+	}
+}
+
+impl<C> frame_system::offchain::CreateTransaction<C> for Runtime
+where
+	RuntimeCall: From<C>,
+{
+	type Extension = TxExtension;
+
+	fn create_transaction(call: Self::RuntimeCall, extension: Self::Extension) -> Self::Extrinsic {
+		UncheckedExtrinsic::new_transaction(call, extension)
+	}
+}
+
+impl<C> frame_system::offchain::CreateAuthorizedTransaction<C> for Runtime
+where
+	RuntimeCall: From<C>,
+{
+	fn create_extension() -> Self::Extension {
+		(
+			frame_system::AuthorizeCall::<Runtime>::new(),
+			frame_system::CheckNonZeroSender::<Runtime>::new(),
+			frame_system::CheckSpecVersion::<Runtime>::new(),
+			frame_system::CheckTxVersion::<Runtime>::new(),
+			frame_system::CheckGenesis::<Runtime>::new(),
+			frame_system::CheckMortality::<Runtime>::from(generic::Era::Immortal),
+			frame_system::CheckNonce::<Runtime>::from(0),
+			frame_system::CheckWeight::<Runtime>::new(),
+			pallet_transaction_payment::ChargeTransactionPayment::<Runtime>::from(0),
+			frame_system::WeightReclaim::<Runtime>::new(),
+		)
+	}
 }
 
 parameter_types! {
@@ -234,6 +274,7 @@ impl pallet_balances::Config for Runtime {
 	type RuntimeFreezeReason = RuntimeFreezeReason;
 	type FreezeIdentifier = ();
 	type MaxFreezes = ConstU32<0>;
+	type DoneSlashHandler = ();
 }
 
 parameter_types! {
@@ -250,6 +291,7 @@ impl pallet_transaction_payment::Config for Runtime {
 	type WeightToFee = WeightToFee;
 	type LengthToFee = frame_support::weights::ConstantMultiplier<Balance, TransactionByteFee>;
 	type FeeMultiplierUpdate = SlowAdjustingFeeUpdate<Self>;
+	type WeightInfo = ();
 }
 
 parameter_types! {
@@ -286,18 +328,22 @@ impl_opaque_keys! {
 impl pallet_session::Config for Runtime {
 	type RuntimeEvent = RuntimeEvent;
 	type ValidatorId = AccountId;
-	type ValidatorIdOf = pallet_staking::StashOf<Self>;
+	type ValidatorIdOf = sp_runtime::traits::ConvertInto;
 	type ShouldEndSession = Babe;
 	type NextSessionRotation = Babe;
 	type SessionManager = Staking;
 	type SessionHandler = <SessionKeys as OpaqueKeys>::KeyTypeIdProviders;
 	type Keys = SessionKeys;
+	type DisablingStrategy = pallet_session::disabling::UpToLimitWithReEnablingDisablingStrategy;
 	type WeightInfo = ();
+	type Currency = Balances;
+	type KeyDeposit = ();
 }
 
 impl pallet_session::historical::Config for Runtime {
-	type FullIdentification = pallet_staking::Exposure<AccountId, Balance>;
-	type FullIdentificationOf = pallet_staking::ExposureOf<Runtime>;
+	type RuntimeEvent = RuntimeEvent;
+	type FullIdentification = ();
+	type FullIdentificationOf = pallet_staking::UnitIdentificationOf<Self>;
 }
 
 pallet_staking_reward_curve::build! {
@@ -322,7 +368,7 @@ parameter_types! {
 	pub const MaxExposurePageSize: u32 = 64;
 	pub const MaxNominators: u32 = 256;
 	pub const MaxAuthorities: u32 = 100_000;
-	pub const OnChainMaxWinners: u32 = u32::MAX;
+	pub const OnChainMaxWinners: u32 = MaxAuthorities::get();
 	// Unbounded number of election targets and voters.
 	pub ElectionBoundsOnChain: ElectionBounds = ElectionBoundsBuilder::default().build();
 }
@@ -335,18 +381,22 @@ impl onchain::Config for OnChainSeqPhragmen {
 	type DataProvider = Staking;
 	type WeightInfo = ();
 	type Bounds = ElectionBoundsOnChain;
-	type MaxWinners = OnChainMaxWinners;
+	type MaxWinnersPerPage = OnChainMaxWinners;
+	type MaxBackersPerWinner = ConstU32<{ u32::MAX }>;
+	type Sort = ConstBool<true>;
 }
 
 /// Upper limit on the number of NPOS nominations.
 const MAX_QUOTA_NOMINATIONS: u32 = 16;
 
 impl pallet_staking::Config for Runtime {
+	type OldCurrency = Balances;
 	type Currency = Balances;
 	type CurrencyBalance = Balance;
 	type UnixTime = Timestamp;
 	type CurrencyToVote = polkadot_runtime_common::CurrencyToVote;
 	type RewardRemainder = ();
+	type RuntimeHoldReason = RuntimeHoldReason;
 	type RuntimeEvent = RuntimeEvent;
 	type Slash = ();
 	type Reward = ();
@@ -371,7 +421,8 @@ impl pallet_staking::Config for Runtime {
 	type BenchmarkingConfig = polkadot_runtime_common::StakingBenchmarkingConfig;
 	type EventListeners = ();
 	type WeightInfo = ();
-	type DisablingStrategy = pallet_staking::UpToLimitDisablingStrategy;
+	type MaxValidatorSet = MaxAuthorities;
+	type Filter = frame_support::traits::Nothing;
 }
 
 parameter_types! {
@@ -394,18 +445,21 @@ impl<LocalCall> frame_system::offchain::CreateSignedTransaction<LocalCall> for R
 where
 	RuntimeCall: From<LocalCall>,
 {
-	fn create_transaction<C: frame_system::offchain::AppCrypto<Self::Public, Self::Signature>>(
+	fn create_signed_transaction<
+		C: frame_system::offchain::AppCrypto<Self::Public, Self::Signature>,
+	>(
 		call: RuntimeCall,
 		public: <Signature as Verify>::Signer,
 		account: AccountId,
 		nonce: <Runtime as frame_system::Config>::Nonce,
-	) -> Option<(RuntimeCall, <UncheckedExtrinsic as ExtrinsicT>::SignaturePayload)> {
+	) -> Option<UncheckedExtrinsic> {
 		let period =
 			BlockHashCount::get().checked_next_power_of_two().map(|c| c / 2).unwrap_or(2) as u64;
 
 		let current_block = System::block_number().saturated_into::<u64>().saturating_sub(1);
 		let tip = 0;
-		let extra: SignedExtra = (
+		let tx_ext: TxExtension = (
+			frame_system::AuthorizeCall::<Runtime>::new(),
 			frame_system::CheckNonZeroSender::<Runtime>::new(),
 			frame_system::CheckSpecVersion::<Runtime>::new(),
 			frame_system::CheckTxVersion::<Runtime>::new(),
@@ -417,16 +471,19 @@ where
 			frame_system::CheckNonce::<Runtime>::from(nonce),
 			frame_system::CheckWeight::<Runtime>::new(),
 			pallet_transaction_payment::ChargeTransactionPayment::<Runtime>::from(tip),
-		);
-		let raw_payload = SignedPayload::new(call, extra)
+			frame_system::WeightReclaim::<Runtime>::new(),
+		)
+			.into();
+		let raw_payload = SignedPayload::new(call, tx_ext)
 			.map_err(|e| {
 				log::warn!("Unable to create signed payload: {:?}", e);
 			})
 			.ok()?;
 		let signature = raw_payload.using_encoded(|payload| C::sign(payload, public))?;
-		let (call, extra, _) = raw_payload.deconstruct();
+		let (call, tx_ext, _) = raw_payload.deconstruct();
 		let address = Indices::unlookup(account);
-		Some((call, (address, signature, extra)))
+		let transaction = UncheckedExtrinsic::new_signed(call, address, signature, tx_ext);
+		Some(transaction)
 	}
 }
 
@@ -496,7 +553,7 @@ impl parachains_shared::Config for Runtime {
 impl parachains_inclusion::Config for Runtime {
 	type RuntimeEvent = RuntimeEvent;
 	type DisputesHandler = ParasDisputes;
-	type RewardValidators = RewardValidatorsWithEraPoints<Runtime>;
+	type RewardValidators = RewardValidatorsWithEraPoints<Runtime, Staking>;
 	type MessageQueue = ();
 	type WeightInfo = ();
 }
@@ -533,7 +590,7 @@ impl parachains_initializer::Config for Runtime {
 	type Randomness = pallet_babe::RandomnessFromOneEpochAgo<Runtime>;
 	type ForceOrigin = frame_system::EnsureRoot<AccountId>;
 	type WeightInfo = ();
-	type CoretimeOnNewSession = ();
+	type CoretimeOnNewSession = Coretime;
 }
 
 impl parachains_session_info::Config for Runtime {
@@ -551,15 +608,29 @@ impl parachains_paras::Config for Runtime {
 	type QueueFootprinter = ParaInclusion;
 	type NextSessionRotation = Babe;
 	type OnNewHead = ();
-	type AssignCoretime = ();
+	type AssignCoretime = Scheduler;
+	type Fungible = Balances;
+	type CooldownRemovalMultiplier = ConstUint<1>;
+	type AuthorizeCurrentCodeOrigin = frame_system::EnsureRoot<AccountId>;
 }
 
 parameter_types! {
 	pub const BrokerId: u32 = 10u32;
+	pub MaxXcmTransactWeight: Weight = Weight::from_parts(10_000_000, 10_000);
+}
+
+pub struct BrokerPot;
+impl Get<InteriorLocation> for BrokerPot {
+	fn get() -> InteriorLocation {
+		unimplemented!()
+	}
 }
 
 parameter_types! {
 	pub const OnDemandTrafficDefaultValue: FixedU128 = FixedU128::from_u32(1);
+	// Keep 2 timeslices worth of revenue information.
+	pub const MaxHistoricalRevenue: BlockNumber = 2 * 5;
+	pub const OnDemandPalletId: PalletId = PalletId(*b"py/ondmd");
 }
 
 impl parachains_dmp::Config for Runtime {}
@@ -581,10 +652,43 @@ impl parachains_hrmp::Config for Runtime {
 	type WeightInfo = parachains_hrmp::TestWeightInfo;
 }
 
-impl parachains_assigner_parachains::Config for Runtime {}
+impl parachains_on_demand::Config for Runtime {
+	type RuntimeEvent = RuntimeEvent;
+	type Currency = Balances;
+	type TrafficDefaultValue = OnDemandTrafficDefaultValue;
+	type WeightInfo = parachains_on_demand::TestWeightInfo;
+	type MaxHistoricalRevenue = MaxHistoricalRevenue;
+	type PalletId = OnDemandPalletId;
+}
 
-impl parachains_scheduler::Config for Runtime {
-	type AssignmentProvider = ParaAssignmentProvider;
+impl parachains_scheduler::Config for Runtime {}
+
+pub struct DummyXcmSender;
+impl SendXcm for DummyXcmSender {
+	type Ticket = ();
+	fn validate(
+		_: &mut Option<Location>,
+		_: &mut Option<xcm::latest::Xcm<()>>,
+	) -> SendResult<Self::Ticket> {
+		Ok(((), Assets::new()))
+	}
+
+	/// Actually carry out the delivery operation for a previously validated message sending.
+	fn deliver(_ticket: Self::Ticket) -> Result<XcmHash, SendError> {
+		Ok([0u8; 32])
+	}
+}
+
+impl coretime::Config for Runtime {
+	type RuntimeOrigin = RuntimeOrigin;
+	type RuntimeEvent = RuntimeEvent;
+	type BrokerId = BrokerId;
+	type WeightInfo = crate::coretime::TestWeightInfo;
+	type SendXcm = DummyXcmSender;
+	type MaxXcmTransactWeight = MaxXcmTransactWeight;
+	type BrokerPotLocation = BrokerPot;
+	type AssetTransactor = ();
+	type AccountToLocation = ();
 }
 
 impl paras_sudo_wrapper::Config for Runtime {}
@@ -611,6 +715,7 @@ pub mod pallet_test_notifier {
 
 	#[pallet::config]
 	pub trait Config: frame_system::Config + pallet_xcm::Config {
+		#[allow(deprecated)]
 		type RuntimeEvent: IsType<<Self as frame_system::Config>::RuntimeEvent> + From<Event<Self>>;
 		type RuntimeOrigin: IsType<<Self as frame_system::Config>::RuntimeOrigin>
 			+ Into<Result<pallet_xcm::Origin, <Self as Config>::RuntimeOrigin>>;
@@ -727,7 +832,8 @@ construct_runtime! {
 		Xcm: pallet_xcm,
 		ParasDisputes: parachains_disputes,
 		ParasSlashing: parachains_slashing,
-		ParaAssignmentProvider: parachains_assigner_parachains,
+		OnDemand: parachains_on_demand,
+		Coretime: coretime,
 
 		Sudo: pallet_sudo,
 
@@ -745,8 +851,9 @@ pub type Block = generic::Block<Header, UncheckedExtrinsic>;
 pub type SignedBlock = generic::SignedBlock<Block>;
 /// `BlockId` type as expected by this runtime.
 pub type BlockId = generic::BlockId<Block>;
-/// The `SignedExtension` to the basic transaction logic.
-pub type SignedExtra = (
+/// The extension to the basic transaction logic.
+pub type TxExtension = (
+	frame_system::AuthorizeCall<Runtime>,
 	frame_system::CheckNonZeroSender<Runtime>,
 	frame_system::CheckSpecVersion<Runtime>,
 	frame_system::CheckTxVersion<Runtime>,
@@ -755,10 +862,14 @@ pub type SignedExtra = (
 	frame_system::CheckNonce<Runtime>,
 	frame_system::CheckWeight<Runtime>,
 	pallet_transaction_payment::ChargeTransactionPayment<Runtime>,
+	frame_system::WeightReclaim<Runtime>,
 );
 /// Unchecked extrinsic type as expected by this runtime.
 pub type UncheckedExtrinsic =
-	generic::UncheckedExtrinsic<Address, RuntimeCall, Signature, SignedExtra>;
+	generic::UncheckedExtrinsic<Address, RuntimeCall, Signature, TxExtension>;
+/// Unchecked signature payload type as expected by this runtime.
+pub type UncheckedSignaturePayload =
+	generic::UncheckedSignaturePayload<Address, Signature, TxExtension>;
 
 /// Executive: handles dispatch to the various modules.
 pub type Executive = frame_executive::Executive<
@@ -769,7 +880,7 @@ pub type Executive = frame_executive::Executive<
 	AllPalletsWithSystem,
 >;
 /// The payload being signed in transactions.
-pub type SignedPayload = generic::SignedPayload<RuntimeCall, SignedExtra>;
+pub type SignedPayload = generic::SignedPayload<RuntimeCall, TxExtension>;
 
 pub type Hash = <Block as BlockT>::Hash;
 pub type Extrinsic = <Block as BlockT>::Extrinsic;
@@ -780,7 +891,7 @@ sp_api::impl_runtime_apis! {
 			VERSION
 		}
 
-		fn execute_block(block: Block) {
+		fn execute_block(block: <Block as BlockT>::LazyBlock) {
 			Executive::execute_block(block);
 		}
 
@@ -817,7 +928,7 @@ sp_api::impl_runtime_apis! {
 		}
 
 		fn check_inherents(
-			block: Block,
+			block: <Block as BlockT>::LazyBlock,
 			data: sp_inherents::InherentData,
 		) -> sp_inherents::CheckInherentsResult {
 			data.check_extrinsics(&block)
@@ -846,7 +957,7 @@ sp_api::impl_runtime_apis! {
 		}
 	}
 
-	#[api_version(11)]
+	#[api_version(16)]
 	impl polkadot_primitives::runtime_api::ParachainHost<Block> for Runtime {
 		fn validators() -> Vec<ValidatorId> {
 			runtime_impl::validators::<Runtime>()
@@ -952,8 +1063,13 @@ sp_api::impl_runtime_apis! {
 		}
 
 		fn unapplied_slashes(
-		) -> Vec<(SessionIndex, CandidateHash, slashing::PendingSlashes)> {
+		) -> Vec<(SessionIndex, CandidateHash, slashing::LegacyPendingSlashes)> {
 			runtime_impl::unapplied_slashes::<Runtime>()
+		}
+
+		fn unapplied_slashes_v2(
+		) -> Vec<(SessionIndex, CandidateHash, slashing::PendingSlashes)> {
+			runtime_impl::unapplied_slashes_v2::<Runtime>()
 		}
 
 		fn key_ownership_proof(
@@ -980,11 +1096,13 @@ sp_api::impl_runtime_apis! {
 			runtime_impl::minimum_backing_votes::<Runtime>()
 		}
 
-		fn para_backing_state(para_id: ParaId) -> Option<polkadot_primitives::vstaging::async_backing::BackingState> {
+		fn para_backing_state(para_id: ParaId) -> Option<polkadot_primitives::async_backing::BackingState> {
+			#[allow(deprecated)]
 			runtime_impl::backing_state::<Runtime>(para_id)
 		}
 
 		fn async_backing_params() -> polkadot_primitives::AsyncBackingParams {
+			#[allow(deprecated)]
 			runtime_impl::async_backing_params::<Runtime>()
 		}
 
@@ -1007,8 +1125,36 @@ sp_api::impl_runtime_apis! {
 		fn candidates_pending_availability(para_id: ParaId) -> Vec<CommittedCandidateReceipt<Hash>> {
 			runtime_impl::candidates_pending_availability::<Runtime>(para_id)
 		}
+
+		fn backing_constraints(para_id: ParaId) -> Option<Constraints> {
+			runtime_impl::backing_constraints::<Runtime>(para_id)
+		}
+
+		fn scheduling_lookahead() -> u32 {
+			runtime_impl::scheduling_lookahead::<Runtime>()
+		}
+
+		fn validation_code_bomb_limit() -> u32 {
+			runtime_impl::validation_code_bomb_limit::<Runtime>()
+		}
+
+		fn para_ids() -> Vec<ParaId> {
+			staging_runtime_impl::para_ids::<Runtime>()
+		}
+
+		fn max_relay_parent_session_age() -> u32 {
+			staging_runtime_impl::max_relay_parent_session_age::<Runtime>()
+		}
+
+		fn ancestor_relay_parent_info(
+			session_index: SessionIndex,
+			relay_parent: Hash,
+		) -> Option<polkadot_primitives::vstaging::RelayParentInfo<Hash, BlockNumber>> {
+			staging_runtime_impl::ancestor_relay_parent_info::<Runtime>(session_index, relay_parent)
+		}
 	}
 
+	#[api_version(6)]
 	impl sp_consensus_beefy::BeefyApi<Block, BeefyId> for Runtime {
 		fn beefy_genesis() -> Option<BlockNumber> {
 			// dummy implementation due to lack of BEEFY pallet.
@@ -1056,15 +1202,9 @@ sp_api::impl_runtime_apis! {
 		) -> Option<sp_consensus_beefy::OpaqueKeyOwnershipProof> {
 			None
 		}
-
-		fn generate_ancestry_proof(
-			_prev_block_number: BlockNumber,
-			_best_known_block_number: Option<BlockNumber>,
-		) -> Option<sp_runtime::OpaqueValue> {
-			None
-		}
 	}
 
+	#[api_version(3)]
 	impl mmr::MmrApi<Block, Hash, BlockNumber> for Runtime {
 		fn mmr_root() -> Result<Hash, mmr::Error> {
 			Err(mmr::Error::PalletNotIncluded)
@@ -1078,6 +1218,13 @@ sp_api::impl_runtime_apis! {
 			_block_numbers: Vec<BlockNumber>,
 			_best_known_block_number: Option<BlockNumber>,
 		) -> Result<(Vec<mmr::EncodableOpaqueLeaf>, mmr::LeafProof<Hash>), mmr::Error> {
+			Err(mmr::Error::PalletNotIncluded)
+		}
+
+		fn generate_ancestry_proof(
+			_prev_block_number: BlockNumber,
+			_best_known_block_number: Option<BlockNumber>,
+		) -> Result<mmr::AncestryProof<Hash>, mmr::Error> {
 			Err(mmr::Error::PalletNotIncluded)
 		}
 
@@ -1102,7 +1249,7 @@ sp_api::impl_runtime_apis! {
 		}
 
 		fn current_set_id() -> fg_primitives::SetId {
-			Grandpa::current_set_id()
+			pallet_grandpa::CurrentSetId::<Runtime>::get()
 		}
 
 		fn submit_report_equivocation_unsigned_extrinsic(
@@ -1164,8 +1311,8 @@ sp_api::impl_runtime_apis! {
 	}
 
 	impl sp_session::SessionKeys<Block> for Runtime {
-		fn generate_session_keys(seed: Option<Vec<u8>>) -> Vec<u8> {
-			SessionKeys::generate(seed)
+		fn generate_session_keys(owner: Vec<u8>, seed: Option<Vec<u8>>) -> sp_session::OpaqueGeneratedSessionKeys {
+			SessionKeys::generate(&owner, seed).into()
 		}
 
 		fn decode_session_keys(

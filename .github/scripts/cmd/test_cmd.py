@@ -7,21 +7,45 @@ import argparse
 
 # Mock data for runtimes-matrix.json
 mock_runtimes_matrix = [
-    {"name": "dev", "package": "kitchensink-runtime", "path": "substrate/frame", "header": "substrate/HEADER-APACHE2",  "template": "substrate/.maintain/frame-weight-template.hbs", "bench_features": "runtime-benchmarks,riscv"},
-    {"name": "westend", "package": "westend-runtime", "path": "polkadot/runtime/westend", "header": "polkadot/file_header.txt", "template": "polkadot/xcm/pallet-xcm-benchmarks/template.hbs", "bench_features": "runtime-benchmarks"},
-    {"name": "rococo", "package": "rococo-runtime", "path": "polkadot/runtime/rococo", "header": "polkadot/file_header.txt", "template": "polkadot/xcm/pallet-xcm-benchmarks/template.hbs", "bench_features": "runtime-benchmarks"},
-    {"name": "asset-hub-westend", "package": "asset-hub-westend-runtime", "path": "cumulus/parachains/runtimes/assets/asset-hub-westend", "header": "cumulus/file_header.txt", "template": "cumulus/templates/xcm-bench-template.hbs", "bench_features": "runtime-benchmarks"},
+    {
+        "name": "dev",
+        "package": "kitchensink-runtime",
+        "path": "substrate/frame",
+        "header": "substrate/HEADER-APACHE2",
+        "template": "substrate/.maintain/frame-weight-template.hbs",
+        "bench_features": "runtime-benchmarks",
+        "bench_flags": "--flag1 --flag2"
+    },
+    {
+        "name": "westend",
+        "package": "westend-runtime",
+        "path": "polkadot/runtime/westend",
+        "header": "polkadot/file_header.txt",
+        "template": "polkadot/xcm/pallet-xcm-benchmarks/template.hbs",
+        "bench_features": "runtime-benchmarks",
+        "bench_flags": "--flag3 --flag4"
+    },
+    {
+        "name": "asset-hub-westend",
+        "package": "asset-hub-westend-runtime",
+        "path": "cumulus/parachains/runtimes/assets/asset-hub-westend",
+        "header": "cumulus/file_header.txt",
+        "template": "cumulus/templates/xcm-bench-template.hbs",
+        "bench_features": "runtime-benchmarks",
+        "bench_flags": "--flag7 --flag8"
+    }
 ]
 
-def get_mock_bench_output(runtime, pallets, output_path, header, template = None):
+def get_mock_bench_output(runtime, pallets, output_path, header, bench_flags, template = None):
     return f"frame-omni-bencher v1 benchmark pallet --extrinsic=* " \
-           f"--runtime=target/release/wbuild/{runtime}-runtime/{runtime.replace('-', '_')}_runtime.wasm " \
+           f"--runtime=target/production/wbuild/{runtime}-runtime/{runtime.replace('-', '_')}_runtime.wasm " \
            f"--pallet={pallets} --header={header} " \
            f"--output={output_path} " \
            f"--wasm-execution=compiled " \
            f"--steps=50 --repeat=20 --heap-pages=4096 " \
            f"{f'--template={template} ' if template else ''}" \
-           f"--no-storage-info --no-min-squares --no-median-slopes"
+           f"--no-storage-info --no-min-squares --no-median-slopes " \
+           f"{bench_flags}"
 
 class TestCmd(unittest.TestCase):
 
@@ -34,7 +58,7 @@ class TestCmd(unittest.TestCase):
         self.patcher6 = patch('importlib.util.spec_from_file_location', return_value=MagicMock())
         self.patcher7 = patch('importlib.util.module_from_spec', return_value=MagicMock())
         self.patcher8 = patch('cmd.generate_prdoc.main', return_value=0)
-        
+
         self.mock_open = self.patcher1.start()
         self.mock_json_load = self.patcher2.start()
         self.mock_parse_args = self.patcher3.start()
@@ -60,23 +84,22 @@ class TestCmd(unittest.TestCase):
 
     def test_bench_command_normal_execution_all_runtimes(self):
         self.mock_parse_args.return_value = (argparse.Namespace(
-            command='bench',
+            command='bench-omni',
             runtime=list(map(lambda x: x['name'], mock_runtimes_matrix)),
             pallet=['pallet_balances'],
-            continue_on_fail=False,
+            fail_fast=True,
             quiet=False,
             clean=False,
             image=None
         ), [])
-        
+
         self.mock_popen.return_value.read.side_effect = [
             "pallet_balances\npallet_staking\npallet_something\n",  # Output for dev runtime
             "pallet_balances\npallet_staking\npallet_something\n",  # Output for westend runtime
-            "pallet_staking\npallet_something\n",                   # Output for rococo runtime - no pallet here
             "pallet_balances\npallet_staking\npallet_something\n",  # Output for asset-hub-westend runtime
             "./substrate/frame/balances/Cargo.toml\n",                # Mock manifest path for dev -> pallet_balances
         ]
-        
+
         with patch('sys.exit') as mock_exit:
             import cmd
             cmd.main()
@@ -84,24 +107,41 @@ class TestCmd(unittest.TestCase):
 
             expected_calls = [
                 # Build calls
-                call("forklift cargo build -p kitchensink-runtime --profile release --features=runtime-benchmarks,riscv"),
-                call("forklift cargo build -p westend-runtime --profile release --features=runtime-benchmarks"),
-                call("forklift cargo build -p rococo-runtime --profile release --features=runtime-benchmarks"),
-                call("forklift cargo build -p asset-hub-westend-runtime --profile release --features=runtime-benchmarks"),
-                
-                call(get_mock_bench_output('kitchensink', 'pallet_balances', './substrate/frame/balances/src/weights.rs', os.path.abspath('substrate/HEADER-APACHE2'), "substrate/.maintain/frame-weight-template.hbs")),
-                call(get_mock_bench_output('westend', 'pallet_balances', './polkadot/runtime/westend/src/weights', os.path.abspath('polkadot/file_header.txt'))),
-                # skips rococo benchmark
-                call(get_mock_bench_output('asset-hub-westend', 'pallet_balances', './cumulus/parachains/runtimes/assets/asset-hub-westend/src/weights', os.path.abspath('cumulus/file_header.txt'))),
+                call("forklift cargo build -q -p kitchensink-runtime --profile production --features=runtime-benchmarks"),
+                call("forklift cargo build -q -p westend-runtime --profile production --features=runtime-benchmarks"),
+                call("forklift cargo build -q -p asset-hub-westend-runtime --profile production --features=runtime-benchmarks"),
+
+                call(get_mock_bench_output(
+                    runtime='kitchensink',
+                    pallets='pallet_balances',
+                    output_path='./substrate/frame/balances/src/weights.rs',
+                    header=os.path.abspath('substrate/HEADER-APACHE2'),
+                    bench_flags='--flag1 --flag2',
+                    template="substrate/.maintain/frame-weight-template.hbs"
+                )),
+                call(get_mock_bench_output(
+                    runtime='westend',
+                    pallets='pallet_balances',
+                    output_path='./polkadot/runtime/westend/src/weights',
+                    header=os.path.abspath('polkadot/file_header.txt'),
+                    bench_flags='--flag3 --flag4'
+                )),
+                call(get_mock_bench_output(
+                    runtime='asset-hub-westend',
+                    pallets='pallet_balances',
+                    output_path='./cumulus/parachains/runtimes/assets/asset-hub-westend/src/weights',
+                    header=os.path.abspath('cumulus/file_header.txt'),
+                    bench_flags='--flag7 --flag8'
+                )),
             ]
             self.mock_system.assert_has_calls(expected_calls, any_order=True)
 
     def test_bench_command_normal_execution(self):
         self.mock_parse_args.return_value = (argparse.Namespace(
-            command='bench',
+            command='bench-omni',
             runtime=['westend'],
             pallet=['pallet_balances', 'pallet_staking'],
-            continue_on_fail=False,
+            fail_fast=True,
             quiet=False,
             clean=False,
             image=None
@@ -110,7 +150,7 @@ class TestCmd(unittest.TestCase):
         self.mock_popen.return_value.read.side_effect = [
             "pallet_balances\npallet_staking\npallet_something\n",  # Output for westend runtime
         ]
-        
+
         with patch('sys.exit') as mock_exit:
             import cmd
             cmd.main()
@@ -118,21 +158,33 @@ class TestCmd(unittest.TestCase):
 
             expected_calls = [
                 # Build calls
-                call("forklift cargo build -p westend-runtime --profile release --features=runtime-benchmarks"),
-                
+                call("forklift cargo build -q -p westend-runtime --profile production --features=runtime-benchmarks"),
+
                 # Westend runtime calls
-                call(get_mock_bench_output('westend', 'pallet_balances', './polkadot/runtime/westend/src/weights', header_path)),
-                call(get_mock_bench_output('westend', 'pallet_staking', './polkadot/runtime/westend/src/weights', header_path)),
+                call(get_mock_bench_output(
+                    runtime='westend',
+                    pallets='pallet_balances',
+                    output_path='./polkadot/runtime/westend/src/weights',
+                    header=header_path,
+                    bench_flags='--flag3 --flag4'
+                )),
+                call(get_mock_bench_output(
+                    runtime='westend',
+                    pallets='pallet_staking',
+                    output_path='./polkadot/runtime/westend/src/weights',
+                    header=header_path,
+                    bench_flags='--flag3 --flag4'
+                )),
             ]
             self.mock_system.assert_has_calls(expected_calls, any_order=True)
 
 
     def test_bench_command_normal_execution_xcm(self):
         self.mock_parse_args.return_value = (argparse.Namespace(
-            command='bench',
+            command='bench-omni',
             runtime=['westend'],
             pallet=['pallet_xcm_benchmarks::generic'],
-            continue_on_fail=False,
+            fail_fast=True,
             quiet=False,
             clean=False,
             image=None
@@ -141,7 +193,7 @@ class TestCmd(unittest.TestCase):
         self.mock_popen.return_value.read.side_effect = [
             "pallet_balances\npallet_staking\npallet_something\npallet_xcm_benchmarks::generic\n",  # Output for westend runtime
         ]
-        
+
         with patch('sys.exit') as mock_exit:
             import cmd
             cmd.main()
@@ -149,34 +201,34 @@ class TestCmd(unittest.TestCase):
 
             expected_calls = [
                 # Build calls
-                call("forklift cargo build -p westend-runtime --profile release --features=runtime-benchmarks"),
-                
+                call("forklift cargo build -q -p westend-runtime --profile production --features=runtime-benchmarks"),
+
                 # Westend runtime calls
                 call(get_mock_bench_output(
-                    'westend', 
-                    'pallet_xcm_benchmarks::generic', 
-                    './polkadot/runtime/westend/src/weights/xcm', 
-                    header_path, 
-                    "polkadot/xcm/pallet-xcm-benchmarks/template.hbs"
+                    runtime='westend',
+                    pallets='pallet_xcm_benchmarks::generic',
+                    output_path='./polkadot/runtime/westend/src/weights/xcm',
+                    header=header_path,
+                    bench_flags='--flag3 --flag4',
+                    template="polkadot/xcm/pallet-xcm-benchmarks/template.hbs"
                 )),
             ]
             self.mock_system.assert_has_calls(expected_calls, any_order=True)
 
     def test_bench_command_two_runtimes_two_pallets(self):
         self.mock_parse_args.return_value = (argparse.Namespace(
-            command='bench',
-            runtime=['westend', 'rococo'],
+            command='bench-omni',
+            runtime=['westend'],
             pallet=['pallet_balances', 'pallet_staking'],
-            continue_on_fail=False,
+            fail_fast=True,
             quiet=False,
             clean=False,
             image=None
         ), [])
         self.mock_popen.return_value.read.side_effect = [
             "pallet_staking\npallet_balances\n",  # Output for westend runtime
-            "pallet_staking\npallet_balances\n",  # Output for rococo runtime
         ]
-        
+
         with patch('sys.exit') as mock_exit:
             import cmd
             cmd.main()
@@ -185,23 +237,31 @@ class TestCmd(unittest.TestCase):
 
             expected_calls = [
                 # Build calls
-                call("forklift cargo build -p westend-runtime --profile release --features=runtime-benchmarks"),
-                call("forklift cargo build -p rococo-runtime --profile release --features=runtime-benchmarks"),
+                call("forklift cargo build -q -p westend-runtime --profile production --features=runtime-benchmarks"),
                 # Westend runtime calls
-                call(get_mock_bench_output('westend', 'pallet_staking', './polkadot/runtime/westend/src/weights', header_path)),
-                call(get_mock_bench_output('westend', 'pallet_balances', './polkadot/runtime/westend/src/weights', header_path)),
-                # Rococo runtime calls
-                call(get_mock_bench_output('rococo', 'pallet_staking', './polkadot/runtime/rococo/src/weights', header_path)),
-                call(get_mock_bench_output('rococo', 'pallet_balances', './polkadot/runtime/rococo/src/weights', header_path)),
+                call(get_mock_bench_output(
+                    runtime='westend',
+                    pallets='pallet_staking',
+                    output_path='./polkadot/runtime/westend/src/weights',
+                    header=header_path,
+                    bench_flags='--flag3 --flag4'
+                )),
+                call(get_mock_bench_output(
+                    runtime='westend',
+                    pallets='pallet_balances',
+                    output_path='./polkadot/runtime/westend/src/weights',
+                    header=header_path,
+                    bench_flags='--flag3 --flag4'
+                )),
             ]
             self.mock_system.assert_has_calls(expected_calls, any_order=True)
 
     def test_bench_command_one_dev_runtime(self):
         self.mock_parse_args.return_value = (argparse.Namespace(
-            command='bench',
+            command='bench-omni',
             runtime=['dev'],
             pallet=['pallet_balances'],
-            continue_on_fail=False,
+            fail_fast=True,
             quiet=False,
             clean=False,
             image=None
@@ -220,24 +280,25 @@ class TestCmd(unittest.TestCase):
 
             expected_calls = [
                 # Build calls
-                call("forklift cargo build -p kitchensink-runtime --profile release --features=runtime-benchmarks,riscv"),
+                call("forklift cargo build -q -p kitchensink-runtime --profile production --features=runtime-benchmarks"),
                 # Westend runtime calls
                 call(get_mock_bench_output(
-                    'kitchensink', 
-                    'pallet_balances', 
-                    manifest_dir + "/src/weights.rs", 
-                    header_path, 
-                    "substrate/.maintain/frame-weight-template.hbs"
+                    runtime='kitchensink',
+                    pallets='pallet_balances',
+                    output_path=manifest_dir + "/src/weights.rs",
+                    header=header_path,
+                    bench_flags='--flag1 --flag2',
+                    template="substrate/.maintain/frame-weight-template.hbs"
                 )),
             ]
             self.mock_system.assert_has_calls(expected_calls, any_order=True)
 
     def test_bench_command_one_cumulus_runtime(self):
         self.mock_parse_args.return_value = (argparse.Namespace(
-            command='bench',
+            command='bench-omni',
             runtime=['asset-hub-westend'],
             pallet=['pallet_assets'],
-            continue_on_fail=False,
+            fail_fast=True,
             quiet=False,
             clean=False,
             image=None
@@ -254,13 +315,14 @@ class TestCmd(unittest.TestCase):
 
             expected_calls = [
                 # Build calls
-                call("forklift cargo build -p asset-hub-westend-runtime --profile release --features=runtime-benchmarks"),
+                call("forklift cargo build -q -p asset-hub-westend-runtime --profile production --features=runtime-benchmarks"),
                 # Asset-hub-westend runtime calls
                 call(get_mock_bench_output(
-                    'asset-hub-westend', 
-                    'pallet_assets', 
-                    './cumulus/parachains/runtimes/assets/asset-hub-westend/src/weights', 
-                    header_path
+                    runtime='asset-hub-westend',
+                    pallets='pallet_assets',
+                    output_path='./cumulus/parachains/runtimes/assets/asset-hub-westend/src/weights',
+                    header=header_path,
+                    bench_flags='--flag7 --flag8'
                 )),
             ]
 
@@ -268,10 +330,10 @@ class TestCmd(unittest.TestCase):
 
     def test_bench_command_one_cumulus_runtime_xcm(self):
         self.mock_parse_args.return_value = (argparse.Namespace(
-            command='bench',
+            command='bench-omni',
             runtime=['asset-hub-westend'],
             pallet=['pallet_xcm_benchmarks::generic', 'pallet_assets'],
-            continue_on_fail=False,
+            fail_fast=True,
             quiet=False,
             clean=False,
             image=None
@@ -288,26 +350,28 @@ class TestCmd(unittest.TestCase):
 
             expected_calls = [
                 # Build calls
-                call("forklift cargo build -p asset-hub-westend-runtime --profile release --features=runtime-benchmarks"),
+                call("forklift cargo build -q -p asset-hub-westend-runtime --profile production --features=runtime-benchmarks"),
                 # Asset-hub-westend runtime calls
                 call(get_mock_bench_output(
-                    'asset-hub-westend', 
-                    'pallet_xcm_benchmarks::generic', 
-                    './cumulus/parachains/runtimes/assets/asset-hub-westend/src/weights/xcm', 
-                    header_path, 
-                    "cumulus/templates/xcm-bench-template.hbs"
+                    runtime='asset-hub-westend',
+                    pallets='pallet_xcm_benchmarks::generic',
+                    output_path='./cumulus/parachains/runtimes/assets/asset-hub-westend/src/weights/xcm',
+                    header=header_path,
+                    bench_flags='--flag7 --flag8',
+                    template="cumulus/templates/xcm-bench-template.hbs"
                 )),
                 call(get_mock_bench_output(
-                    'asset-hub-westend', 
-                    'pallet_assets', 
-                    './cumulus/parachains/runtimes/assets/asset-hub-westend/src/weights', 
-                    header_path
+                    runtime='asset-hub-westend',
+                    pallets='pallet_assets',
+                    output_path='./cumulus/parachains/runtimes/assets/asset-hub-westend/src/weights',
+                    header=header_path,
+                    bench_flags='--flag7 --flag8'
                 )),
             ]
 
             self.mock_system.assert_has_calls(expected_calls, any_order=True)
 
-    @patch('argparse.ArgumentParser.parse_known_args', return_value=(argparse.Namespace(command='fmt', continue_on_fail=False), []))
+    @patch('argparse.ArgumentParser.parse_known_args', return_value=(argparse.Namespace(command='fmt'), []))
     @patch('os.system', return_value=0)
     def test_fmt_command(self, mock_system, mock_parse_args):
         with patch('sys.exit') as mock_exit:
@@ -317,7 +381,7 @@ class TestCmd(unittest.TestCase):
             mock_system.assert_any_call('cargo +nightly fmt')
             mock_system.assert_any_call('taplo format --config .config/taplo.toml')
 
-    @patch('argparse.ArgumentParser.parse_known_args', return_value=(argparse.Namespace(command='update-ui', continue_on_fail=False), []))
+    @patch('argparse.ArgumentParser.parse_known_args', return_value=(argparse.Namespace(command='update-ui'), []))
     @patch('os.system', return_value=0)
     def test_update_ui_command(self, mock_system, mock_parse_args):
         with patch('sys.exit') as mock_exit:
@@ -326,7 +390,7 @@ class TestCmd(unittest.TestCase):
             mock_exit.assert_not_called()
             mock_system.assert_called_with('sh ./scripts/update-ui-tests.sh')
 
-    @patch('argparse.ArgumentParser.parse_known_args', return_value=(argparse.Namespace(command='prdoc', continue_on_fail=False), []))
+    @patch('argparse.ArgumentParser.parse_known_args', return_value=(argparse.Namespace(command='prdoc'), []))
     @patch('os.system', return_value=0)
     def test_prdoc_command(self, mock_system, mock_parse_args):
         with patch('sys.exit') as mock_exit:
@@ -334,6 +398,347 @@ class TestCmd(unittest.TestCase):
             cmd.main()
             mock_exit.assert_not_called()
             self.mock_generate_prdoc_main.assert_called_with(mock_parse_args.return_value[0])
+
+    @patch.dict('os.environ', {'PR_NUM': '123', 'IS_ORG_MEMBER': 'true', 'IS_PR_AUTHOR': 'false', 'GITHUB_TOKEN': 'fake_token'})
+    @patch('cmd.get_allowed_labels')
+    @patch('cmd.check_pr_status')
+    @patch('argparse.ArgumentParser.parse_known_args')
+    def test_label_command_valid_labels(self, mock_parse_args, mock_check_pr_status, mock_get_labels):
+        """Test label command with valid labels"""
+        mock_get_labels.return_value = ['T1-FRAME', 'R0-no-crate-publish-required', 'D2-substantial']
+        mock_check_pr_status.return_value = True  # PR is open
+        mock_parse_args.return_value = (argparse.Namespace(
+            command='label',
+            labels=['T1-FRAME', 'R0-no-crate-publish-required']
+        ), [])
+
+        with patch('sys.exit') as mock_exit, patch('builtins.print') as mock_print:
+            import cmd
+            cmd.main()
+            mock_exit.assert_not_called()
+
+            # Check that JSON output was printed
+            json_call = None
+            for call in mock_print.call_args_list:
+                if 'LABELS_JSON:' in str(call):
+                    json_call = call
+                    break
+
+            self.assertIsNotNone(json_call)
+            self.assertIn('T1-FRAME', str(json_call))
+            self.assertIn('R0-no-crate-publish-required', str(json_call))
+
+    @patch.dict('os.environ', {'PR_NUM': '123', 'IS_ORG_MEMBER': 'true', 'IS_PR_AUTHOR': 'false', 'GITHUB_TOKEN': 'fake_token'})
+    @patch('cmd.get_allowed_labels')
+    @patch('cmd.check_pr_status')
+    @patch('argparse.ArgumentParser.parse_known_args')
+    def test_label_command_auto_correction(self, mock_parse_args, mock_check_pr_status, mock_get_labels):
+        """Test label command with auto-correctable typos"""
+        mock_get_labels.return_value = ['T1-FRAME', 'R0-no-crate-publish-required', 'D2-substantial']
+        mock_check_pr_status.return_value = True  # PR is open
+        mock_parse_args.return_value = (argparse.Namespace(
+            command='label',
+            labels=['T1-FRAM', 'R0-no-crate-publish']  # Typos that should be auto-corrected
+        ), [])
+
+        with patch('sys.exit') as mock_exit, patch('builtins.print') as mock_print:
+            import cmd
+            cmd.main()
+            mock_exit.assert_not_called()
+
+            # Check for auto-correction messages
+            correction_messages = [str(call) for call in mock_print.call_args_list if 'Auto-corrected' in str(call)]
+            self.assertTrue(len(correction_messages) > 0)
+
+            # Check that JSON output contains corrected labels
+            json_call = None
+            for call in mock_print.call_args_list:
+                if 'LABELS_JSON:' in str(call):
+                    json_call = call
+                    break
+
+            self.assertIsNotNone(json_call)
+            self.assertIn('T1-FRAME', str(json_call))
+            self.assertIn('R0-no-crate-publish-required', str(json_call))
+
+    @patch.dict('os.environ', {'PR_NUM': '123', 'IS_ORG_MEMBER': 'true', 'IS_PR_AUTHOR': 'false', 'GITHUB_TOKEN': 'fake_token'})
+    @patch('cmd.get_allowed_labels')
+    @patch('cmd.check_pr_status')
+    @patch('argparse.ArgumentParser.parse_known_args')
+    def test_label_command_prefix_correction(self, mock_parse_args, mock_check_pr_status, mock_get_labels):
+        """Test label command with prefix matching"""
+        mock_get_labels.return_value = ['T1-FRAME', 'T2-pallets', 'R0-no-crate-publish-required']
+        mock_check_pr_status.return_value = True  # PR is open
+        mock_parse_args.return_value = (argparse.Namespace(
+            command='label',
+            labels=['T1-something']  # Should match T1-FRAME as the only T1- label
+        ), [])
+
+        with patch('sys.exit') as mock_exit, patch('builtins.print') as mock_print:
+            import cmd
+            cmd.main()
+            mock_exit.assert_not_called()
+
+            # Check that JSON output contains corrected label
+            json_call = None
+            for call in mock_print.call_args_list:
+                if 'LABELS_JSON:' in str(call):
+                    json_call = call
+                    break
+
+            self.assertIsNotNone(json_call)
+            self.assertIn('T1-FRAME', str(json_call))
+
+    @patch.dict('os.environ', {'PR_NUM': '123', 'IS_ORG_MEMBER': 'true', 'IS_PR_AUTHOR': 'false', 'GITHUB_TOKEN': 'fake_token'})
+    @patch('cmd.get_allowed_labels')
+    @patch('cmd.check_pr_status')
+    @patch('argparse.ArgumentParser.parse_known_args')
+    def test_label_command_invalid_labels(self, mock_parse_args, mock_check_pr_status, mock_get_labels):
+        """Test label command with invalid labels that cannot be corrected"""
+        mock_get_labels.return_value = ['T1-FRAME', 'R0-no-crate-publish-required', 'D2-substantial']
+        mock_check_pr_status.return_value = True  # PR is open
+        mock_parse_args.return_value = (argparse.Namespace(
+            command='label',
+            labels=['INVALID-LABEL', 'ANOTHER-BAD-LABEL']
+        ), [])
+
+        with patch('sys.exit') as mock_exit, patch('builtins.print') as mock_print:
+            import cmd
+            cmd.main()
+            mock_exit.assert_called_with(1)  # Should exit with error code
+
+            # Check for error JSON output
+            error_json_call = None
+            for call in mock_print.call_args_list:
+                if 'ERROR_JSON:' in str(call):
+                    error_json_call = call
+                    break
+
+            self.assertIsNotNone(error_json_call)
+            self.assertIn('validation_failed', str(error_json_call))
+
+    @patch.dict('os.environ', {'PR_NUM': '123', 'IS_ORG_MEMBER': 'true', 'IS_PR_AUTHOR': 'false', 'GITHUB_TOKEN': 'fake_token'})
+    @patch('cmd.get_allowed_labels')
+    @patch('cmd.check_pr_status')
+    @patch('argparse.ArgumentParser.parse_known_args')
+    def test_label_command_mixed_valid_invalid(self, mock_parse_args, mock_check_pr_status, mock_get_labels):
+        """Test label command with mix of valid and invalid labels"""
+        mock_get_labels.return_value = ['T1-FRAME', 'R0-no-crate-publish-required', 'D2-substantial']
+        mock_check_pr_status.return_value = True  # PR is open
+        mock_parse_args.return_value = (argparse.Namespace(
+            command='label',
+            labels=['T1-FRAME', 'INVALID-LABEL', 'D2-substantial']
+        ), [])
+
+        with patch('sys.exit') as mock_exit, patch('builtins.print') as mock_print:
+            import cmd
+            cmd.main()
+            mock_exit.assert_called_with(1)  # Should exit with error code due to invalid label
+
+            # Check for error JSON output
+            error_json_call = None
+            for call in mock_print.call_args_list:
+                if 'ERROR_JSON:' in str(call):
+                    error_json_call = call
+                    break
+
+            self.assertIsNotNone(error_json_call)
+
+    @patch.dict('os.environ', {'PR_NUM': '123', 'IS_ORG_MEMBER': 'true', 'IS_PR_AUTHOR': 'false', 'GITHUB_TOKEN': 'fake_token'})
+    @patch('cmd.get_allowed_labels')
+    @patch('cmd.check_pr_status')
+    @patch('argparse.ArgumentParser.parse_known_args')
+    def test_label_command_fetch_failure(self, mock_parse_args, mock_check_pr_status, mock_get_labels):
+        """Test label command when label fetching fails"""
+        mock_get_labels.side_effect = RuntimeError("Failed to fetch labels from repository. Please check your connection and try again.")
+        mock_check_pr_status.return_value = True  # PR is open
+        mock_parse_args.return_value = (argparse.Namespace(
+            command='label',
+            labels=['T1-FRAME']
+        ), [])
+
+        with patch('sys.exit') as mock_exit, patch('builtins.print') as mock_print:
+            import cmd
+            cmd.main()
+            mock_exit.assert_called_with(1)  # Should exit with error code
+
+            # Check for error JSON output
+            error_json_call = None
+            for call in mock_print.call_args_list:
+                if 'ERROR_JSON:' in str(call):
+                    error_json_call = call
+                    break
+
+            self.assertIsNotNone(error_json_call)
+            self.assertIn('Failed to fetch labels from repository', str(error_json_call))
+
+    def test_auto_correct_labels_function(self):
+        """Test the auto_correct_labels function directly"""
+        import cmd
+
+        valid_labels = ['T1-FRAME', 'R0-no-crate-publish-required', 'D2-substantial', 'I2-bug']
+
+        # Test high similarity auto-correction
+        corrections, suggestions = cmd.auto_correct_labels(['T1-FRAM'], valid_labels)
+        self.assertEqual(len(corrections), 1)
+        self.assertEqual(corrections[0][0], 'T1-FRAM')
+        self.assertEqual(corrections[0][1], 'T1-FRAME')
+
+        # Test low similarity suggestions
+        corrections, suggestions = cmd.auto_correct_labels(['TOTALLY-WRONG'], valid_labels)
+        self.assertEqual(len(corrections), 0)
+        self.assertEqual(len(suggestions), 1)
+
+    def test_find_closest_labels_function(self):
+        """Test the find_closest_labels function directly"""
+        import cmd
+
+        valid_labels = ['T1-FRAME', 'T2-pallets', 'R0-no-crate-publish-required']
+
+        # Test finding close matches
+        matches = cmd.find_closest_labels('T1-FRAM', valid_labels)
+        self.assertIn('T1-FRAME', matches)
+
+        # Test no close matches
+        matches = cmd.find_closest_labels('COMPLETELY-DIFFERENT', valid_labels, cutoff=0.8)
+        self.assertEqual(len(matches), 0)
+
+    @patch.dict('os.environ', {'PR_NUM': '123', 'IS_ORG_MEMBER': 'true', 'IS_PR_AUTHOR': 'false', 'GITHUB_TOKEN': 'fake_token'})
+    @patch('cmd.get_allowed_labels')
+    @patch('cmd.check_pr_status')
+    @patch('argparse.ArgumentParser.parse_known_args')
+    def test_label_command_merged_pr(self, mock_parse_args, mock_check_pr_status, mock_get_labels):
+        """Test label command on merged PR should fail"""
+        mock_get_labels.return_value = ['T1-FRAME', 'R0-no-crate-publish-required']
+        mock_check_pr_status.return_value = False  # PR is merged/closed
+        mock_parse_args.return_value = (argparse.Namespace(
+            command='label',
+            labels=['T1-FRAME']
+        ), [])
+
+        with patch('sys.exit') as mock_exit, patch('builtins.print') as mock_print:
+            import cmd
+            cmd.main()
+            mock_exit.assert_called_with(1)
+
+            # Check for error JSON output
+            error_json_call = None
+            for call in mock_print.call_args_list:
+                if 'ERROR_JSON:' in str(call):
+                    error_json_call = call
+                    break
+
+            self.assertIsNotNone(error_json_call)
+            self.assertIn('Cannot modify labels on merged PRs', str(error_json_call))
+
+    @patch.dict('os.environ', {'PR_NUM': '123', 'IS_ORG_MEMBER': 'true', 'IS_PR_AUTHOR': 'false', 'GITHUB_TOKEN': 'fake_token'})
+    @patch('cmd.get_allowed_labels')
+    @patch('cmd.check_pr_status')
+    @patch('argparse.ArgumentParser.parse_known_args')
+    def test_label_command_open_pr(self, mock_parse_args, mock_check_pr_status, mock_get_labels):
+        """Test label command on open PR should succeed"""
+        mock_get_labels.return_value = ['T1-FRAME', 'R0-no-crate-publish-required']
+        mock_check_pr_status.return_value = True  # PR is open
+        mock_parse_args.return_value = (argparse.Namespace(
+            command='label',
+            labels=['T1-FRAME']
+        ), [])
+
+        with patch('sys.exit') as mock_exit, patch('builtins.print') as mock_print:
+            import cmd
+            cmd.main()
+            mock_exit.assert_not_called()
+
+            # Check that JSON output was printed
+            json_call = None
+            for call in mock_print.call_args_list:
+                if 'LABELS_JSON:' in str(call):
+                    json_call = call
+                    break
+
+            self.assertIsNotNone(json_call)
+
+    @patch.dict('os.environ', {'PR_NUM': '123', 'IS_ORG_MEMBER': 'false', 'IS_PR_AUTHOR': 'false', 'GITHUB_TOKEN': 'fake_token'})
+    @patch('cmd.get_allowed_labels')
+    @patch('cmd.check_pr_status')
+    @patch('argparse.ArgumentParser.parse_known_args')
+    def test_label_command_unauthorized_user(self, mock_parse_args, mock_check_pr_status, mock_get_labels):
+        """Test label command by unauthorized user should fail"""
+        mock_get_labels.return_value = ['T1-FRAME', 'R0-no-crate-publish-required']
+        mock_check_pr_status.return_value = True  # PR is open
+        mock_parse_args.return_value = (argparse.Namespace(
+            command='label',
+            labels=['T1-FRAME']
+        ), [])
+
+        with patch('sys.exit') as mock_exit, patch('builtins.print') as mock_print:
+            import cmd
+            cmd.main()
+            mock_exit.assert_called_with(1)
+
+            # Check for error JSON output
+            error_json_call = None
+            for call in mock_print.call_args_list:
+                if 'ERROR_JSON:' in str(call):
+                    error_json_call = call
+                    break
+
+            self.assertIsNotNone(error_json_call)
+            self.assertIn('Only the PR author or organization members can modify labels', str(error_json_call))
+
+    @patch.dict('os.environ', {'PR_NUM': '123', 'IS_ORG_MEMBER': 'false', 'IS_PR_AUTHOR': 'true', 'GITHUB_TOKEN': 'fake_token'})
+    @patch('cmd.get_allowed_labels')
+    @patch('cmd.check_pr_status')
+    @patch('argparse.ArgumentParser.parse_known_args')
+    def test_label_command_pr_author(self, mock_parse_args, mock_check_pr_status, mock_get_labels):
+        """Test label command by PR author should succeed"""
+        mock_get_labels.return_value = ['T1-FRAME', 'R0-no-crate-publish-required']
+        mock_check_pr_status.return_value = True  # PR is open
+        mock_parse_args.return_value = (argparse.Namespace(
+            command='label',
+            labels=['T1-FRAME']
+        ), [])
+
+        with patch('sys.exit') as mock_exit, patch('builtins.print') as mock_print:
+            import cmd
+            cmd.main()
+            mock_exit.assert_not_called()
+
+            # Check that JSON output was printed
+            json_call = None
+            for call in mock_print.call_args_list:
+                if 'LABELS_JSON:' in str(call):
+                    json_call = call
+                    break
+
+            self.assertIsNotNone(json_call)
+
+    @patch.dict('os.environ', {'PR_NUM': '123', 'IS_ORG_MEMBER': 'true', 'IS_PR_AUTHOR': 'false', 'GITHUB_TOKEN': 'fake_token'})
+    @patch('cmd.get_allowed_labels')
+    @patch('cmd.check_pr_status')
+    @patch('argparse.ArgumentParser.parse_known_args')
+    def test_label_command_org_member(self, mock_parse_args, mock_check_pr_status, mock_get_labels):
+        """Test label command by org member should succeed"""
+        mock_get_labels.return_value = ['T1-FRAME', 'R0-no-crate-publish-required']
+        mock_check_pr_status.return_value = True  # PR is open
+        mock_parse_args.return_value = (argparse.Namespace(
+            command='label',
+            labels=['T1-FRAME']
+        ), [])
+
+        with patch('sys.exit') as mock_exit, patch('builtins.print') as mock_print:
+            import cmd
+            cmd.main()
+            mock_exit.assert_not_called()
+
+            # Check that JSON output was printed
+            json_call = None
+            for call in mock_print.call_args_list:
+                if 'LABELS_JSON:' in str(call):
+                    json_call = call
+                    break
+
+            self.assertIsNotNone(json_call)
 
 if __name__ == '__main__':
     unittest.main()

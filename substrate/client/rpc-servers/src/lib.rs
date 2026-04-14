@@ -23,8 +23,9 @@
 pub mod middleware;
 pub mod utils;
 
-use std::{error::Error as StdError, net::SocketAddr, time::Duration};
+use std::{error::Error as StdError, net::SocketAddr, sync::Arc, time::Duration};
 
+use futures::future::BoxFuture;
 use jsonrpsee::{
 	core::BoxError,
 	server::{
@@ -47,18 +48,86 @@ pub use utils::{RpcEndpoint, RpcMethods};
 
 const MEGABYTE: u32 = 1024 * 1024;
 
+/// Creates a dedicated tokio runtime for RPC operations.
+///
+/// This runtime isolates RPC blocking operations from the rest of the node
+/// by limiting the number of blocking threads to `max_connections`.
+pub fn create_rpc_runtime(max_connections: u32) -> std::io::Result<tokio::runtime::Runtime> {
+	tokio::runtime::Builder::new_multi_thread()
+		.thread_name("rpc")
+		.enable_all()
+		.max_blocking_threads((max_connections as usize).max(1))
+		.on_thread_start(|| {
+			sc_utils::metrics::TOKIO_THREADS_ALIVE.inc();
+			sc_utils::metrics::TOKIO_THREADS_TOTAL.inc();
+			middleware::RPC_THREADS_ALIVE.inc();
+			middleware::RPC_THREADS_TOTAL.inc();
+		})
+		.on_thread_stop(|| {
+			sc_utils::metrics::TOKIO_THREADS_ALIVE.dec();
+			middleware::RPC_THREADS_ALIVE.dec();
+		})
+		.build()
+}
+
+/// Spawn handle for RPC tasks that uses the dedicated RPC runtime.
+///
+/// This ensures all RPC-related task spawning (including rpc-spec-v2 APIs like
+/// chainHead and transactionWatch) runs on the isolated RPC runtime rather than
+/// the main node runtime.
+#[derive(Clone)]
+pub struct RpcSpawnHandle {
+	handle: tokio::runtime::Handle,
+}
+
+impl RpcSpawnHandle {
+	/// Create a new RpcSpawnHandle from a tokio runtime handle.
+	pub fn new(handle: tokio::runtime::Handle) -> Self {
+		Self { handle }
+	}
+}
+
+impl sp_core::traits::SpawnNamed for RpcSpawnHandle {
+	fn spawn_blocking(
+		&self,
+		_name: &'static str,
+		_group: Option<&'static str>,
+		future: BoxFuture<'static, ()>,
+	) {
+		let handle = self.handle.clone();
+		self.handle.spawn_blocking(move || {
+			handle.block_on(future);
+		});
+	}
+
+	fn spawn(
+		&self,
+		_name: &'static str,
+		_group: Option<&'static str>,
+		future: BoxFuture<'static, ()>,
+	) {
+		self.handle.spawn(future);
+	}
+}
+
 /// Type to encapsulate the server handle and listening address.
 pub struct Server {
 	/// Handle to the rpc server
 	handle: ServerHandle,
 	/// Listening address of the server
 	listen_addrs: Vec<SocketAddr>,
+	/// Dedicated RPC runtime (kept alive for the lifetime of the server)
+	rpc_runtime: Option<tokio::runtime::Runtime>,
 }
 
 impl Server {
 	/// Creates a new Server.
-	pub fn new(handle: ServerHandle, listen_addrs: Vec<SocketAddr>) -> Server {
-		Server { handle, listen_addrs }
+	pub fn new(
+		handle: ServerHandle,
+		listen_addrs: Vec<SocketAddr>,
+		rpc_runtime: tokio::runtime::Runtime,
+	) -> Server {
+		Server { handle, listen_addrs, rpc_runtime: Some(rpc_runtime) }
 	}
 
 	/// Returns the `jsonrpsee::server::ServerHandle` for this Server. Can be used to stop the
@@ -71,12 +140,29 @@ impl Server {
 	pub fn listen_addrs(&self) -> &[SocketAddr] {
 		&self.listen_addrs
 	}
+
+	/// Returns the spawn handle for tasks on the dedicated RPC runtime.
+	pub fn spawn_handle(&self) -> Arc<dyn sp_core::traits::SpawnNamed> {
+		Arc::new(RpcSpawnHandle::new(
+			self.rpc_runtime
+				.as_ref()
+				.expect("rpc_runtime is only taken in Drop; qed")
+				.handle()
+				.clone(),
+		))
+	}
 }
 
 impl Drop for Server {
 	fn drop(&mut self) {
 		// This doesn't not wait for the server to be stopped but fires the signal.
 		let _ = self.handle.stop();
+
+		// Use `shutdown_background()` to avoid blocking, which would panic if
+		// we are being dropped from within an async context.
+		if let Some(runtime) = self.rpc_runtime.take() {
+			runtime.shutdown_background();
+		}
 	}
 }
 
@@ -89,18 +175,19 @@ pub trait SubscriptionIdProvider:
 dyn_clone::clone_trait_object!(SubscriptionIdProvider);
 
 /// RPC server configuration.
-#[derive(Debug)]
 pub struct Config<M: Send + Sync + 'static> {
 	/// RPC interfaces to start.
 	pub endpoints: Vec<RpcEndpoint>,
 	/// Metrics.
 	pub metrics: Option<RpcMetrics>,
-	/// RPC API.
+	/// RPC API module.
 	pub rpc_api: RpcModule<M>,
 	/// Subscription ID provider.
 	pub id_provider: Option<Box<dyn SubscriptionIdProvider>>,
-	/// Tokio runtime handle.
-	pub tokio_handle: tokio::runtime::Handle,
+	/// RPC logger capacity (default: 1024).
+	pub request_logger_limit: u32,
+	/// Dedicated RPC runtime.
+	pub rpc_runtime: tokio::runtime::Runtime,
 }
 
 #[derive(Debug, Clone)]
@@ -116,13 +203,16 @@ pub async fn start_server<M>(config: Config<M>) -> Result<Server, Box<dyn StdErr
 where
 	M: Send + Sync,
 {
-	let Config { endpoints, metrics, tokio_handle, rpc_api, id_provider } = config;
+	let Config { endpoints, metrics, rpc_api, id_provider, request_logger_limit, rpc_runtime } =
+		config;
+
+	let rpc_handle = rpc_runtime.handle().clone();
 
 	let (stop_handle, server_handle) = stop_channel();
 	let cfg = PerConnection {
 		methods: build_rpc_api(rpc_api).into(),
 		metrics,
-		tokio_handle: tokio_handle.clone(),
+		tokio_handle: rpc_handle.clone(),
 		stop_handle,
 	};
 
@@ -144,11 +234,56 @@ where
 		local_addrs.push(local_addr);
 		let cfg = cfg.clone();
 
-		let mut id_provider2 = id_provider.clone();
+		let RpcSettings {
+			batch_config,
+			max_connections,
+			max_payload_in_mb,
+			max_payload_out_mb,
+			max_buffer_capacity_per_connection,
+			max_subscriptions_per_connection,
+			rpc_methods,
+			rate_limit_trust_proxy_headers,
+			rate_limit_whitelisted_ips,
+			host_filter,
+			cors,
+			rate_limit,
+		} = listener.rpc_settings();
 
-		tokio_handle.spawn(async move {
+		let http_middleware = tower::ServiceBuilder::new()
+			.option_layer(host_filter)
+			// Proxy `GET /health, /health/readiness` requests to the internal
+			// `system_health` method.
+			.layer(NodeHealthProxyLayer::default())
+			.layer(cors);
+
+		let mut builder = jsonrpsee::server::Server::builder()
+			.max_request_body_size(max_payload_in_mb.saturating_mul(MEGABYTE))
+			.max_response_body_size(max_payload_out_mb.saturating_mul(MEGABYTE))
+			.max_connections(max_connections)
+			.max_subscriptions_per_connection(max_subscriptions_per_connection)
+			.enable_ws_ping(
+				PingConfig::new()
+					.ping_interval(Duration::from_secs(30))
+					.inactive_limit(Duration::from_secs(60))
+					.max_failures(3),
+			)
+			.set_http_middleware(http_middleware)
+			.set_message_buffer_capacity(max_buffer_capacity_per_connection)
+			.set_batch_request_config(batch_config)
+			.custom_tokio_runtime(rpc_handle.clone());
+
+		if let Some(provider) = id_provider.clone() {
+			builder = builder.set_id_provider(provider);
+		} else {
+			builder = builder.set_id_provider(RandomStringIdProvider::new(16));
+		};
+
+		let service_builder = builder.to_service_builder();
+		let deny_unsafe = deny_unsafe(&local_addr, &rpc_methods);
+
+		rpc_handle.spawn(async move {
 			loop {
-				let (sock, remote_addr, rpc_cfg) = tokio::select! {
+				let (sock, remote_addr) = tokio::select! {
 					res = listener.accept() => {
 						match res {
 							Ok(s) => s,
@@ -161,57 +296,10 @@ where
 					_ = cfg.stop_handle.clone().shutdown() => break,
 				};
 
-				let RpcSettings {
-					batch_config,
-					max_connections,
-					max_payload_in_mb,
-					max_payload_out_mb,
-					max_buffer_capacity_per_connection,
-					max_subscriptions_per_connection,
-					rpc_methods,
-					rate_limit_trust_proxy_headers,
-					rate_limit_whitelisted_ips,
-					host_filter,
-					cors,
-					rate_limit,
-				} = rpc_cfg;
-
-				let http_middleware = tower::ServiceBuilder::new()
-					.option_layer(host_filter)
-					// Proxy `GET /health, /health/readiness` requests to the internal
-					// `system_health` method.
-					.layer(NodeHealthProxyLayer::default())
-					.layer(cors);
-
-				let mut builder = jsonrpsee::server::Server::builder()
-					.max_request_body_size(max_payload_in_mb.saturating_mul(MEGABYTE))
-					.max_response_body_size(max_payload_out_mb.saturating_mul(MEGABYTE))
-					.max_connections(max_connections)
-					.max_subscriptions_per_connection(max_subscriptions_per_connection)
-					.enable_ws_ping(
-						PingConfig::new()
-							.ping_interval(Duration::from_secs(30))
-							.inactive_limit(Duration::from_secs(60))
-							.max_failures(3),
-					)
-					.set_http_middleware(http_middleware)
-					.set_message_buffer_capacity(max_buffer_capacity_per_connection)
-					.set_batch_request_config(batch_config)
-					.custom_tokio_runtime(cfg.tokio_handle.clone())
-					.set_id_provider(RandomStringIdProvider::new(16));
-
-				if let Some(provider) = id_provider2.take() {
-					builder = builder.set_id_provider(provider);
-				} else {
-					builder = builder.set_id_provider(RandomStringIdProvider::new(16));
-				};
-
-				let service_builder = builder.to_service_builder();
-				let deny_unsafe = deny_unsafe(&local_addr, &rpc_methods);
-
 				let ip = remote_addr.ip();
 				let cfg2 = cfg.clone();
 				let service_builder2 = service_builder.clone();
+				let rate_limit_whitelisted_ips2 = rate_limit_whitelisted_ips.clone();
 
 				let svc =
 					tower::service_fn(move |mut req: http::Request<hyper::body::Incoming>| {
@@ -224,14 +312,14 @@ where
 						let proxy_ip =
 							if rate_limit_trust_proxy_headers { get_proxy_ip(&req) } else { None };
 
-						let rate_limit_cfg = if rate_limit_whitelisted_ips
+						let rate_limit_cfg = if rate_limit_whitelisted_ips2
 							.iter()
 							.any(|ips| ips.contains(proxy_ip.unwrap_or(ip)))
 						{
 							log::debug!(target: "rpc", "ip={ip}, proxy_ip={:?} is trusted, disabling rate-limit", proxy_ip);
 							None
 						} else {
-							if !rate_limit_whitelisted_ips.is_empty() {
+							if !rate_limit_whitelisted_ips2.is_empty() {
 								log::debug!(target: "rpc", "ip={ip}, proxy_ip={:?} is not trusted, rate-limit enabled", proxy_ip);
 							}
 							rate_limit
@@ -255,8 +343,9 @@ where
 							),
 						};
 
-						let rpc_middleware =
-							RpcServiceBuilder::new().option_layer(middleware_layer.clone());
+						let rpc_middleware = RpcServiceBuilder::new()
+							.rpc_logger(request_logger_limit)
+							.option_layer(middleware_layer.clone());
 						let mut svc = service_builder
 							.set_rpc_middleware(rpc_middleware)
 							.build(methods, stop_handle);
@@ -304,5 +393,5 @@ where
 	// This is to make it work with old scripts/utils that parse the logs.
 	log::info!("Running JSON-RPC server: addr={}", format_listen_addrs(&local_addrs));
 
-	Ok(Server::new(server_handle, local_addrs))
+	Ok(Server::new(server_handle, local_addrs, rpc_runtime))
 }

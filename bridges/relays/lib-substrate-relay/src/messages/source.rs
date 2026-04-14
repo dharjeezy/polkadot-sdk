@@ -29,16 +29,15 @@ use crate::{
 	TransactionParams,
 };
 
-use async_std::sync::Arc;
 use async_trait::async_trait;
 use bp_messages::{
 	storage_keys::{operating_mode_key, outbound_lane_data_key},
 	target_chain::FromBridgedChainMessagesProof,
 	ChainWithMessages as _, InboundMessageDetails, MessageNonce, MessagePayload,
-	MessagesOperatingMode, OutboundLaneData, OutboundMessageDetails,
+	MessagesOperatingMode, OutboundMessageDetails,
 };
 use bp_runtime::{BasicOperatingMode, HeaderIdProvider, RangeInclusiveExt};
-use codec::Encode;
+use codec::{Decode, Encode};
 use frame_support::weights::Weight;
 use messages_relay::{
 	message_lane::{MessageLane, SourceHeaderIdOf, TargetHeaderIdOf},
@@ -55,13 +54,25 @@ use relay_substrate_client::{
 };
 use relay_utils::relay_loop::Client as RelayClient;
 use sp_core::Pair;
-use std::ops::RangeInclusive;
+use std::{ops::RangeInclusive, sync::Arc};
 
 /// Intermediate message proof returned by the source Substrate node. Includes everything
 /// required to submit to the target node: cumulative dispatch weight of bundled messages and
 /// the proof itself.
 pub type SubstrateMessagesProof<C, L> = (Weight, FromBridgedChainMessagesProof<HashOf<C>, L>);
 type MessagesToRefine<'a> = Vec<(MessagePayload, &'a mut OutboundMessageDetails)>;
+
+/// Outbound lane data - for backwards compatibility with `bp_messages::OutboundLaneData` which has
+/// additional `lane_state` attribute.
+///
+/// TODO: remove - https://github.com/paritytech/polkadot-sdk/issues/5923
+#[derive(Decode)]
+struct LegacyOutboundLaneData {
+	#[allow(unused)]
+	oldest_unpruned_nonce: MessageNonce,
+	latest_received_nonce: MessageNonce,
+	latest_generated_nonce: MessageNonce,
+}
 
 /// Substrate client as Substrate messages source.
 pub struct SubstrateMessagesSource<P: SubstrateMessageLane, SourceClnt, TargetClnt> {
@@ -98,7 +109,7 @@ impl<P: SubstrateMessageLane, SourceClnt: Client<P::SourceChain>, TargetClnt>
 	async fn outbound_lane_data(
 		&self,
 		id: SourceHeaderIdOf<MessageLaneAdapter<P>>,
-	) -> Result<Option<OutboundLaneData>, SubstrateError> {
+	) -> Result<Option<LegacyOutboundLaneData>, SubstrateError> {
 		self.source_client
 			.storage_value(
 				id.hash(),
@@ -277,20 +288,20 @@ where
 					P::TargetChain::NAME,
 					in_msgs_details.len(),
 					msgs_to_refine_batch.len(),
-				)))
+				)));
 			}
 			for ((_, out_msg_details), in_msg_details) in
 				msgs_to_refine_batch.iter_mut().zip(in_msgs_details)
 			{
-				log::trace!(
+				tracing::trace!(
 					target: "bridge",
-					"Refined weight of {}->{} message {:?}/{}: at-source: {}, at-target: {}",
-					P::SourceChain::NAME,
-					P::TargetChain::NAME,
-					self.lane_id,
-					out_msg_details.nonce,
-					out_msg_details.dispatch_weight,
-					in_msg_details.dispatch_weight,
+					source=%P::SourceChain::NAME,
+					target=%P::TargetChain::NAME,
+					lane_id=?self.lane_id,
+					nonce=%out_msg_details.nonce,
+					at_source=%out_msg_details.dispatch_weight,
+					at_target=%in_msg_details.dispatch_weight,
+					"Refined weight of source->target message"
 				);
 				out_msg_details.dispatch_weight = in_msg_details.dispatch_weight;
 			}
@@ -388,7 +399,7 @@ where
 			if let Some(batch_tx) =
 				BatchProofTransaction::new(target_to_source_headers_relay.clone(), id.0).await?
 			{
-				return Ok(Some(batch_tx))
+				return Ok(Some(batch_tx));
 			}
 
 			target_to_source_headers_relay.require_more_headers(id.0).await;
@@ -511,12 +522,12 @@ fn validate_out_msgs_details<C: Chain>(
 	if out_msgs_details.len() > nonces.clone().count() {
 		return Err(SubstrateError::Custom(
 			"More messages than requested returned by the message_details call.".into(),
-		))
+		));
 	}
 
 	// Check if last nonce is missing. The loop below is not checking this.
 	if out_msgs_details.is_empty() && !nonces.is_empty() {
-		return make_missing_nonce_error(*nonces.end())
+		return make_missing_nonce_error(*nonces.end());
 	}
 
 	let mut nonces_iter = nonces.clone().rev().peekable();
@@ -526,7 +537,7 @@ fn validate_out_msgs_details<C: Chain>(
 		nonces_iter.next();
 		if out_msg_details.nonce != nonce {
 			// Some nonces are missing from the middle/tail of the range. This is critical error.
-			return make_missing_nonce_error(nonce)
+			return make_missing_nonce_error(nonce);
 		}
 	}
 
@@ -534,11 +545,11 @@ fn validate_out_msgs_details<C: Chain>(
 	// some messages were already pruned from the source node. This is not a critical error
 	// and will be auto-resolved by messages lane (and target node).
 	if nonces_iter.peek().is_some() {
-		log::info!(
+		tracing::info!(
 			target: "bridge",
-			"Some messages are missing from the {} node: {:?}. Target node may be out of sync?",
-			C::NAME,
-			nonces_iter.rev().collect::<Vec<_>>(),
+			node=%C::NAME,
+			missing=?nonces_iter.rev().collect::<Vec<_>>(),
+			"Some messages are missing. Target node may be out of sync?"
 		);
 	}
 
@@ -563,7 +574,7 @@ fn split_msgs_to_refine<Source: Chain + ChainWithMessages, Target: Chain, LaneId
 					Source::FROM_CHAIN_MESSAGE_DETAILS_METHOD,
 					Target::NAME,
 					Target::max_extrinsic_size(),
-				)))
+				)));
 			}
 
 			if let Some(msg) = current_msgs_batch.pop() {
@@ -742,5 +753,39 @@ mod tests {
 			],
 			Ok(vec![2, 4, 3]),
 		);
+	}
+
+	#[test]
+	fn outbound_lane_data_wrapper_is_compatible() {
+		let bytes_without_state =
+			vec![1, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0];
+		let bytes_with_state = {
+			// add state byte `bp_messages::LaneState::Opened`
+			let mut b = bytes_without_state.clone();
+			b.push(0);
+			b
+		};
+
+		let full = bp_messages::OutboundLaneData {
+			oldest_unpruned_nonce: 1,
+			latest_received_nonce: 2,
+			latest_generated_nonce: 3,
+			state: bp_messages::LaneState::Opened,
+		};
+		assert_eq!(full.encode(), bytes_with_state);
+		assert_ne!(full.encode(), bytes_without_state);
+
+		// decode from `bytes_with_state`
+		let decoded: LegacyOutboundLaneData = Decode::decode(&mut &bytes_with_state[..]).unwrap();
+		assert_eq!(full.oldest_unpruned_nonce, decoded.oldest_unpruned_nonce);
+		assert_eq!(full.latest_received_nonce, decoded.latest_received_nonce);
+		assert_eq!(full.latest_generated_nonce, decoded.latest_generated_nonce);
+
+		// decode from `bytes_without_state`
+		let decoded: LegacyOutboundLaneData =
+			Decode::decode(&mut &bytes_without_state[..]).unwrap();
+		assert_eq!(full.oldest_unpruned_nonce, decoded.oldest_unpruned_nonce);
+		assert_eq!(full.latest_received_nonce, decoded.latest_received_nonce);
+		assert_eq!(full.latest_generated_nonce, decoded.latest_generated_nonce);
 	}
 }

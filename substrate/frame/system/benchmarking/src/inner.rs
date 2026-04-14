@@ -112,9 +112,8 @@ mod benchmarks {
 			System::<T>::set_code_without_checks(RawOrigin::Root.into(), code)?;
 		}
 
-		let current_code =
-			storage::unhashed::get_raw(well_known_keys::CODE).ok_or("Code not stored.")?;
-		assert_eq!(current_code.len(), 4_000_000 as usize);
+		let code = storage::unhashed::get_raw(well_known_keys::CODE).ok_or("Code not stored.")?;
+		assert_eq!(code.len(), 4_000_000 as usize);
 		Ok(())
 	}
 
@@ -205,7 +204,7 @@ mod benchmarks {
 		#[extrinsic_call]
 		authorize_upgrade(RawOrigin::Root, hash);
 
-		assert!(System::<T>::authorized_upgrade().is_some());
+		assert_eq!(System::<T>::authorized_upgrade().unwrap().code_hash(), &hash);
 		Ok(())
 	}
 

@@ -30,9 +30,10 @@
 //! (which requires state not owned by the request manager).
 
 use super::{
-	seconded_and_sufficient, BENEFIT_VALID_RESPONSE, BENEFIT_VALID_STATEMENT,
-	COST_IMPROPERLY_DECODED_RESPONSE, COST_INVALID_RESPONSE, COST_INVALID_SIGNATURE,
-	COST_UNREQUESTED_RESPONSE_STATEMENT, REQUEST_RETRY_DELAY,
+	seconded_and_sufficient, TransposedClaimQueue, BENEFIT_VALID_RESPONSE, BENEFIT_VALID_STATEMENT,
+	COST_IMPROPERLY_DECODED_RESPONSE, COST_INVALID_RESPONSE, COST_INVALID_SESSION_INDEX,
+	COST_INVALID_SIGNATURE, COST_INVALID_UMP_SIGNALS, COST_UNREQUESTED_RESPONSE_STATEMENT,
+	REQUEST_RETRY_DELAY,
 };
 use crate::LOG_TARGET;
 
@@ -43,13 +44,13 @@ use polkadot_node_network_protocol::{
 		v2::{AttestedCandidateRequest, AttestedCandidateResponse},
 		OutgoingRequest, OutgoingResult, MAX_PARALLEL_ATTESTED_CANDIDATE_REQUESTS,
 	},
-	v2::StatementFilter,
+	v3::StatementFilter,
 	PeerId, UnifiedReputationChange as Rep,
 };
 use polkadot_primitives::{
-	CandidateHash, CommittedCandidateReceipt, CompactStatement, GroupIndex, Hash, Id as ParaId,
-	PersistedValidationData, SessionIndex, SignedStatement, SigningContext, ValidatorId,
-	ValidatorIndex,
+	CandidateHash, CommittedCandidateReceiptV2 as CommittedCandidateReceipt, CompactStatement,
+	GroupIndex, Hash, Id as ParaId, PersistedValidationData, SessionIndex, SignedStatement,
+	SigningContext, ValidatorId, ValidatorIndex,
 };
 
 use futures::{future::BoxFuture, prelude::*, stream::FuturesUnordered};
@@ -71,8 +72,8 @@ use std::{
 /// anything other than the candidate hash.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct CandidateIdentifier {
-	/// The relay-parent this candidate is ostensibly under.
-	pub relay_parent: Hash,
+	/// The scheduling-parent this candidate is ostensibly under.
+	pub scheduling_parent: Hash,
 	/// The hash of the candidate.
 	pub candidate_hash: CandidateHash,
 	/// The index of the group claiming to be assigned to the candidate's
@@ -101,13 +102,13 @@ pub struct RequestedCandidate {
 impl RequestedCandidate {
 	fn is_pending(&self) -> bool {
 		if self.in_flight {
-			return false
+			return false;
 		}
 
 		if let Some(next_retry_time) = self.next_retry_time {
 			let can_retry = Instant::now() >= next_retry_time;
 			if !can_retry {
-				return false
+				return false;
 			}
 		}
 
@@ -179,11 +180,11 @@ impl RequestManager {
 	/// manager doesn't store this request already.
 	pub fn get_or_insert(
 		&mut self,
-		relay_parent: Hash,
+		scheduling_parent: Hash,
 		candidate_hash: CandidateHash,
 		group_index: GroupIndex,
-	) -> Entry {
-		let identifier = CandidateIdentifier { relay_parent, candidate_hash, group_index };
+	) -> Entry<'_> {
+		let identifier = CandidateIdentifier { scheduling_parent, candidate_hash, group_index };
 
 		let (candidate, fresh) = match self.requests.entry(identifier.clone()) {
 			HEntry::Occupied(e) => (e.into_mut(), false),
@@ -239,12 +240,12 @@ impl RequestManager {
 	}
 
 	/// Remove based on relay-parent.
-	pub fn remove_by_relay_parent(&mut self, relay_parent: Hash) {
+	pub fn remove_by_scheduling_parent(&mut self, scheduling_parent: Hash) {
 		let mut candidate_hashes = HashSet::new();
 
 		// Remove from `by_priority` and `requests`.
 		self.by_priority.retain(|(_priority, id)| {
-			let retain = relay_parent != id.relay_parent;
+			let retain = scheduling_parent != id.scheduling_parent;
 			if !retain {
 				self.requests.remove(id);
 				candidate_hashes.insert(id.candidate_hash);
@@ -256,7 +257,7 @@ impl RequestManager {
 		for candidate_hash in candidate_hashes {
 			match self.unique_identifiers.entry(candidate_hash) {
 				HEntry::Occupied(mut entry) => {
-					entry.get_mut().retain(|id| relay_parent != id.relay_parent);
+					entry.get_mut().retain(|id| scheduling_parent != id.scheduling_parent);
 					if entry.get().is_empty() {
 						entry.remove();
 					}
@@ -278,7 +279,7 @@ impl RequestManager {
 	pub fn has_pending_requests(&self) -> bool {
 		for (_id, entry) in &self.requests {
 			if entry.is_pending() {
-				return true
+				return true;
 			}
 		}
 
@@ -325,7 +326,7 @@ impl RequestManager {
 		// we would need to request it for each candidate, around 25 right now
 		// on kusama.
 		if response_manager.len() >= 2 * MAX_PARALLEL_ATTESTED_CANDIDATE_REQUESTS as usize {
-			return None
+			return None;
 		}
 
 		let mut res = None;
@@ -344,19 +345,19 @@ impl RequestManager {
 						"Missing entry for priority queue member",
 					);
 
-					continue
+					continue;
 				},
 				Some(e) => e,
 			};
 
 			if !entry.is_pending() {
-				continue
+				continue;
 			}
 
 			let props = match request_props(&id) {
 				None => {
 					cleanup_outdated.push((i, id.clone()));
-					continue
+					continue;
 				},
 				Some(s) => s,
 			};
@@ -403,7 +404,7 @@ impl RequestManager {
 			entry.in_flight = true;
 
 			res = Some(request);
-			break
+			break;
 		}
 
 		for (priority_index, identifier) in cleanup_outdated.into_iter().rev() {
@@ -489,13 +490,13 @@ fn find_request_target_with_update(
 	for (i, p) in known_by.iter().enumerate() {
 		// If we are already sending to that peer, skip for now
 		if response_manager.is_sending_to(p) {
-			continue
+			continue;
 		}
 
 		let mut filter = match peer_advertised(candidate_identifier, p) {
 			None => {
 				prune.push(i);
-				continue
+				continue;
 			},
 			Some(f) => f,
 		};
@@ -504,7 +505,7 @@ fn find_request_target_with_update(
 		filter.mask_valid(&props.unwanted_mask.validated_in_group);
 		if seconded_and_sufficient(&filter, props.backing_threshold) {
 			target = Some((i, *p));
-			break
+			break;
 		}
 	}
 
@@ -566,6 +567,7 @@ impl UnhandledResponse {
 		validator_key_lookup: impl Fn(ValidatorIndex) -> Option<ValidatorId>,
 		allowed_para_lookup: impl Fn(ParaId, GroupIndex) -> bool,
 		disabled_mask: BitVec<u8, Lsb0>,
+		transposed_cq: &TransposedClaimQueue,
 	) -> ResponseValidationOutput {
 		let UnhandledResponse {
 			response: TaggedResponse { identifier, requested_peer, props, response },
@@ -579,12 +581,13 @@ impl UnhandledResponse {
 		// it could also happen in the case that we had a request in-flight
 		// and the request entry was garbage-collected on outdated relay parent.
 		let entry = match manager.requests.get_mut(&identifier) {
-			None =>
+			None => {
 				return ResponseValidationOutput {
 					requested_peer,
 					reputation_changes: Vec::new(),
 					request_status: CandidateRequestStatus::Outdated,
-				},
+				}
+			},
 			Some(e) => e,
 		};
 
@@ -622,7 +625,7 @@ impl UnhandledResponse {
 					requested_peer,
 					reputation_changes: vec![(requested_peer, COST_IMPROPERLY_DECODED_RESPONSE)],
 					request_status: CandidateRequestStatus::Incomplete,
-				}
+				};
 			},
 			Err(e @ RequestError::NetworkError(_) | e @ RequestError::Canceled(_)) => {
 				gum::trace!(
@@ -635,7 +638,7 @@ impl UnhandledResponse {
 					requested_peer,
 					reputation_changes: vec![],
 					request_status: CandidateRequestStatus::Incomplete,
-				}
+				};
 			},
 			Ok(response) => response,
 		};
@@ -650,6 +653,7 @@ impl UnhandledResponse {
 			validator_key_lookup,
 			allowed_para_lookup,
 			disabled_mask,
+			transposed_cq,
 		);
 
 		if let CandidateRequestStatus::Complete { .. } = output.request_status {
@@ -670,6 +674,7 @@ fn validate_complete_response(
 	validator_key_lookup: impl Fn(ValidatorIndex) -> Option<ValidatorId>,
 	allowed_para_lookup: impl Fn(ParaId, GroupIndex) -> bool,
 	disabled_mask: BitVec<u8, Lsb0>,
+	transposed_cq: &TransposedClaimQueue,
 ) -> ResponseValidationOutput {
 	let RequestProperties { backing_threshold, mut unwanted_mask } = props;
 
@@ -687,39 +692,72 @@ fn validate_complete_response(
 		unwanted_mask.validated_in_group.resize(group.len(), true);
 	}
 
-	let invalid_candidate_output = || ResponseValidationOutput {
+	let invalid_candidate_output = |cost: Rep| ResponseValidationOutput {
 		request_status: CandidateRequestStatus::Incomplete,
-		reputation_changes: vec![(requested_peer, COST_INVALID_RESPONSE)],
+		reputation_changes: vec![(requested_peer, cost)],
 		requested_peer,
 	};
+
+	let mut rep_changes = Vec::new();
 
 	// sanity-check candidate response.
 	// note: roughly ascending cost of operations
 	{
-		if response.candidate_receipt.descriptor.relay_parent != identifier.relay_parent {
-			return invalid_candidate_output()
+		if response.candidate_receipt.descriptor.scheduling_parent() != identifier.scheduling_parent
+		{
+			return invalid_candidate_output(COST_INVALID_RESPONSE);
 		}
 
-		if response.candidate_receipt.descriptor.persisted_validation_data_hash !=
+		if response.candidate_receipt.descriptor.persisted_validation_data_hash() !=
 			response.persisted_validation_data.hash()
 		{
-			return invalid_candidate_output()
+			return invalid_candidate_output(COST_INVALID_RESPONSE);
 		}
 
 		if !allowed_para_lookup(
-			response.candidate_receipt.descriptor.para_id,
+			response.candidate_receipt.descriptor.para_id(),
 			identifier.group_index,
 		) {
-			return invalid_candidate_output()
+			return invalid_candidate_output(COST_INVALID_RESPONSE);
 		}
 
 		if response.candidate_receipt.hash() != identifier.candidate_hash {
-			return invalid_candidate_output()
+			return invalid_candidate_output(COST_INVALID_RESPONSE);
+		}
+
+		let candidate_hash = response.candidate_receipt.hash();
+
+		// Validate the ump signals.
+		if let Err(err) = response.candidate_receipt.parse_ump_signals(transposed_cq) {
+			gum::debug!(
+				target: LOG_TARGET,
+				?candidate_hash,
+				?err,
+				peer = ?requested_peer,
+				"Received candidate has invalid UMP signals"
+			);
+			return invalid_candidate_output(COST_INVALID_UMP_SIGNALS);
+		}
+
+		// Check if `session_index` of relay parent matches candidate descriptor
+		// `session_index`.
+		if let Some(candidate_session_index) = response.candidate_receipt.descriptor.session_index()
+		{
+			if candidate_session_index != session {
+				gum::debug!(
+					target: LOG_TARGET,
+					?candidate_hash,
+					peer = ?requested_peer,
+					session_index = session,
+					candidate_session_index,
+					"Received candidate has invalid session index"
+				);
+				return invalid_candidate_output(COST_INVALID_SESSION_INDEX);
+			}
 		}
 	}
 
 	// statement checks.
-	let mut rep_changes = Vec::new();
 	let statements = {
 		let mut statements =
 			Vec::with_capacity(std::cmp::min(response.statements.len(), group.len() * 2));
@@ -729,7 +767,7 @@ fn validate_complete_response(
 		let index_in_group = |v: ValidatorIndex| group.iter().position(|x| &v == x);
 
 		let signing_context =
-			SigningContext { parent_hash: identifier.relay_parent, session_index: session };
+			SigningContext { parent_hash: identifier.scheduling_parent, session_index: session };
 
 		for unchecked_statement in response.statements.into_iter().take(group.len() * 2) {
 			// ensure statement is from a validator in the group.
@@ -737,7 +775,7 @@ fn validate_complete_response(
 				Some(i) => i,
 				None => {
 					rep_changes.push((requested_peer, COST_UNREQUESTED_RESPONSE_STATEMENT));
-					continue
+					continue;
 				},
 			};
 
@@ -746,7 +784,7 @@ fn validate_complete_response(
 				&identifier.candidate_hash
 			{
 				rep_changes.push((requested_peer, COST_UNREQUESTED_RESPONSE_STATEMENT));
-				continue
+				continue;
 			}
 
 			// filter out duplicates or statements outside the mask.
@@ -756,36 +794,36 @@ fn validate_complete_response(
 				CompactStatement::Seconded(_) => {
 					if unwanted_mask.seconded_in_group[i] {
 						rep_changes.push((requested_peer, COST_UNREQUESTED_RESPONSE_STATEMENT));
-						continue
+						continue;
 					}
 
 					if received_filter.seconded_in_group[i] {
 						rep_changes.push((requested_peer, COST_UNREQUESTED_RESPONSE_STATEMENT));
-						continue
+						continue;
 					}
 				},
 				CompactStatement::Valid(_) => {
 					if unwanted_mask.validated_in_group[i] {
 						rep_changes.push((requested_peer, COST_UNREQUESTED_RESPONSE_STATEMENT));
-						continue
+						continue;
 					}
 
 					if received_filter.validated_in_group[i] {
 						rep_changes.push((requested_peer, COST_UNREQUESTED_RESPONSE_STATEMENT));
-						continue
+						continue;
 					}
 				},
 			}
 
 			if disabled_mask.get(i).map_or(false, |x| *x) {
-				continue
+				continue;
 			}
 
 			let validator_public =
 				match validator_key_lookup(unchecked_statement.unchecked_validator_index()) {
 					None => {
 						rep_changes.push((requested_peer, COST_INVALID_SIGNATURE));
-						continue
+						continue;
 					},
 					Some(p) => p,
 				};
@@ -794,7 +832,7 @@ fn validate_complete_response(
 				match unchecked_statement.try_into_checked(&signing_context, &validator_public) {
 					Err(_) => {
 						rep_changes.push((requested_peer, COST_INVALID_SIGNATURE));
-						continue
+						continue;
 					},
 					Ok(checked) => checked,
 				};
@@ -815,7 +853,7 @@ fn validate_complete_response(
 		// Only accept responses which are sufficient, according to our
 		// required backing threshold.
 		if !seconded_and_sufficient(&received_filter, backing_threshold) {
-			return invalid_candidate_output()
+			return invalid_candidate_output(COST_INVALID_RESPONSE);
 		}
 
 		statements
@@ -872,7 +910,7 @@ fn insert_or_update_priority(
 		// expected identifier.
 		if priority_sorted[prev_index].0 == new_priority {
 			// unchanged.
-			return prev_index
+			return prev_index;
 		} else {
 			priority_sorted.remove(prev_index);
 		}
@@ -928,7 +966,7 @@ mod tests {
 		assert_eq!(request_manager.by_priority.len(), 6);
 		assert_eq!(request_manager.unique_identifiers.len(), 5);
 
-		request_manager.remove_by_relay_parent(parent_a);
+		request_manager.remove_by_scheduling_parent(parent_a);
 
 		assert_eq!(request_manager.requests.len(), 3);
 		assert_eq!(request_manager.by_priority.len(), 3);
@@ -939,7 +977,7 @@ mod tests {
 		// Duplicate hash should still be there (under a different parent).
 		assert!(request_manager.unique_identifiers.contains_key(&duplicate_hash));
 
-		request_manager.remove_by_relay_parent(parent_b);
+		request_manager.remove_by_scheduling_parent(parent_b);
 
 		assert_eq!(request_manager.requests.len(), 1);
 		assert_eq!(request_manager.by_priority.len(), 1);
@@ -948,7 +986,7 @@ mod tests {
 		assert!(!request_manager.unique_identifiers.contains_key(&candidate_b1));
 		assert!(!request_manager.unique_identifiers.contains_key(&candidate_b2));
 
-		request_manager.remove_by_relay_parent(parent_c);
+		request_manager.remove_by_scheduling_parent(parent_c);
 
 		assert!(request_manager.requests.is_empty());
 		assert!(request_manager.by_priority.is_empty());
@@ -1019,6 +1057,7 @@ mod tests {
 		candidate_receipt.descriptor.persisted_validation_data_hash =
 			persisted_validation_data.hash();
 		let candidate = candidate_receipt.hash();
+		let candidate_receipt: CommittedCandidateReceipt = candidate_receipt.into();
 		let requested_peer_1 = PeerId::random();
 		let requested_peer_2 = PeerId::random();
 
@@ -1074,7 +1113,7 @@ mod tests {
 					requested_peer: requested_peer_1,
 					props: request_properties.clone(),
 					response: Ok(AttestedCandidateResponse {
-						candidate_receipt: candidate_receipt.clone(),
+						candidate_receipt: candidate_receipt.clone().into(),
 						persisted_validation_data: persisted_validation_data.clone(),
 						statements,
 					}),
@@ -1090,6 +1129,7 @@ mod tests {
 				validator_key_lookup,
 				allowed_para_lookup,
 				disabled_mask.clone(),
+				&Default::default(),
 			);
 			assert_eq!(
 				output,
@@ -1114,7 +1154,7 @@ mod tests {
 					requested_peer: requested_peer_2,
 					props: request_properties,
 					response: Ok(AttestedCandidateResponse {
-						candidate_receipt: candidate_receipt.clone(),
+						candidate_receipt: candidate_receipt.clone().into(),
 						persisted_validation_data: persisted_validation_data.clone(),
 						statements,
 					}),
@@ -1129,6 +1169,7 @@ mod tests {
 				validator_key_lookup,
 				allowed_para_lookup,
 				disabled_mask,
+				&Default::default(),
 			);
 			assert_eq!(
 				output,
@@ -1186,7 +1227,7 @@ mod tests {
 		}
 
 		// Garbage collect based on relay parent.
-		request_manager.remove_by_relay_parent(relay_parent);
+		request_manager.remove_by_scheduling_parent(relay_parent);
 
 		// Try to validate response.
 		{
@@ -1197,7 +1238,7 @@ mod tests {
 					requested_peer,
 					props: request_properties,
 					response: Ok(AttestedCandidateResponse {
-						candidate_receipt: candidate_receipt.clone(),
+						candidate_receipt: candidate_receipt.clone().into(),
 						persisted_validation_data: persisted_validation_data.clone(),
 						statements,
 					}),
@@ -1213,6 +1254,7 @@ mod tests {
 				validator_key_lookup,
 				allowed_para_lookup,
 				disabled_mask,
+				&Default::default(),
 			);
 			assert_eq!(
 				output,
@@ -1277,7 +1319,7 @@ mod tests {
 					requested_peer,
 					props: request_properties.clone(),
 					response: Ok(AttestedCandidateResponse {
-						candidate_receipt: candidate_receipt.clone(),
+						candidate_receipt: candidate_receipt.clone().into(),
 						persisted_validation_data: persisted_validation_data.clone(),
 						statements,
 					}),
@@ -1294,13 +1336,14 @@ mod tests {
 				validator_key_lookup,
 				allowed_para_lookup,
 				disabled_mask,
+				&Default::default(),
 			);
 			assert_eq!(
 				output,
 				ResponseValidationOutput {
 					requested_peer,
 					request_status: CandidateRequestStatus::Complete {
-						candidate: candidate_receipt.clone(),
+						candidate: candidate_receipt.clone().into(),
 						persisted_validation_data: persisted_validation_data.clone(),
 						statements,
 					},
@@ -1417,7 +1460,7 @@ mod tests {
 					requested_peer: requested_peer_1,
 					props: request_properties.clone(),
 					response: Ok(AttestedCandidateResponse {
-						candidate_receipt: candidate_receipt_1.clone(),
+						candidate_receipt: candidate_receipt_1.clone().into(),
 						persisted_validation_data: persisted_validation_data_1.clone(),
 						statements,
 					}),
@@ -1432,6 +1475,7 @@ mod tests {
 				validator_key_lookup,
 				allowed_para_lookup,
 				disabled_mask.clone(),
+				&Default::default(),
 			);
 
 			// First request served successfully
