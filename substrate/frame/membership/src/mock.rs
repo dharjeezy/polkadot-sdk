@@ -93,13 +93,8 @@ impl Config for Test {
 	type WeightInfo = ();
 }
 
-pub struct ExtBuilder {}
-
-impl Default for ExtBuilder {
-	fn default() -> Self {
-		Self {}
-	}
-}
+#[derive(Default)]
+pub struct ExtBuilder;
 
 impl ExtBuilder {
 	pub fn build(self) -> sp_io::TestExternalities {

@@ -366,7 +366,7 @@ impl<T: Config<I>, I: 'static> Pallet<T, I> {
 	/// Ensure the correctness of the state of this pallet.
 	///
 	/// This should be valid before or after each state transition of this pallet.
-	pub fn do_try_state() -> Result<(), sp_runtime::TryRuntimeError> {
+	pub(crate) fn do_try_state() -> Result<(), sp_runtime::TryRuntimeError> {
 		Self::try_state_membership()?;
 
 		Ok(())
@@ -383,7 +383,7 @@ impl<T: Config<I>, I: 'static> Pallet<T, I> {
 		}
 
 		ensure!(
-			members.len() <= T::MaxMembers::get() as usize,
+			Members::<T, I>::decode_len().unwrap_or(0) <= T::MaxMembers::get() as usize,
 			"`Member` cannot be greater than `MaxMember`"
 		);
 		Ok(())
