@@ -51,7 +51,9 @@ use sp_consensus_beefy::{
 	ValidatorSet as BeefyValidatorSet,
 };
 
-use frame_support::{crypto::ecdsa::ECDSAExt, ensure, pallet_prelude::Weight, traits::Get};
+#[cfg(any(feature = "try-runtime", test))]
+use frame_support::ensure;
+use frame_support::{crypto::ecdsa::ECDSAExt, pallet_prelude::Weight, traits::Get};
 use frame_system::pallet_prelude::{BlockNumberFor, HeaderFor};
 
 pub use pallet::*;
