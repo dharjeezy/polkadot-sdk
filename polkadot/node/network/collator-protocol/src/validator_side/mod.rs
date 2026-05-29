@@ -175,13 +175,9 @@ use polkadot_primitives::{
 
 use super::{modify_reputation, tick_stream, LOG_TARGET};
 
-mod claim_queue_state;
 mod collation;
 pub mod error;
 
-// Only export PerLeafClaimQueueState for validator_side_experimental
-// ClaimQueueState (basic.rs) is no longer used in validator_side after the leaf-based refactoring
-pub(crate) use claim_queue_state::PerLeafClaimQueueState;
 pub use collation::BlockedCollationId;
 use collation::{
 	fetched_collation_sanity_check, CollationEvent, CollationFetchError, CollationFetchRequest,
@@ -2670,6 +2666,7 @@ where
 pub async fn request_prospective_validation_data<Sender>(
 	sender: &mut Sender,
 	candidate_relay_parent: Hash,
+	session_index: SessionIndex,
 	parent_head_data_hash: Hash,
 	para_id: ParaId,
 	maybe_parent_head_data: Option<HeadData>,
@@ -2685,8 +2682,12 @@ where
 		ParentHeadData::OnlyHash(parent_head_data_hash)
 	};
 
-	let request =
-		ProspectiveValidationDataRequest { para_id, candidate_relay_parent, parent_head_data };
+	let request = ProspectiveValidationDataRequest {
+		para_id,
+		candidate_relay_parent,
+		session_index,
+		parent_head_data,
+	};
 
 	sender
 		.send_message(ProspectiveParachainsMessage::GetProspectiveValidationData(request, tx))
@@ -2743,9 +2744,15 @@ async fn kick_off_seconding<Context>(
 				// we must pass the actual relay_parent (execution context), not the
 				// scheduling_parent. For V1/V2 these are identical; for V3 the
 				// relay_parent may be older.
+				let session_index = candidate_receipt
+					.descriptor()
+					.session_index()
+					.unwrap_or(per_scheduling_parent.session_index);
+
 				let pvd = request_prospective_validation_data(
 					ctx.sender(),
 					candidate_receipt.descriptor().relay_parent(),
+					session_index,
 					parent_head_data_hash,
 					para_id,
 					maybe_parent_head_data.clone(),
