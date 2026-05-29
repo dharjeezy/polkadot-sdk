@@ -27,6 +27,7 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 use frame_support::{
+	ensure,
 	traits::{ChangeMembers, Contains, ContainsLengthBound, Get, InitializeMembers, SortedMembers},
 	BoundedVec,
 };
