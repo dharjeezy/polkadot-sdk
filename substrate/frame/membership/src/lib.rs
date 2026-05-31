@@ -378,6 +378,7 @@ impl<T: Config<I>, I: 'static> Pallet<T, I> {
 	/// * `Prime` member must be part of `Members`
 	/// * Numbers of `Members` cannot be more than `MaxMember` allowed
 	fn try_state_membership() -> Result<(), sp_runtime::TryRuntimeError> {
+		use frame_support::ensure;
 		let members = Members::<T, I>::get();
 		if let Some(prime) = Prime::<T, I>::get() {
 			ensure!(members.contains(&prime), "`Prime` must be a member of  `Members` in storage");
