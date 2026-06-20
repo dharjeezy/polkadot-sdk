@@ -68,14 +68,13 @@ use scale_info::TypeInfo;
 use sp_arithmetic::traits::{Saturating, Zero};
 
 use frame_support::{
-	defensive,
+	BoundedVec, CloneNoBound, DebugNoBound, EqNoBound, PartialEqNoBound, defensive,
 	dispatch::DispatchResultWithPostInfo,
 	ensure, impl_ensure_origin_with_arg_ignoring_arg,
 	traits::{
-		tokens::Balance as BalanceTrait, EnsureOrigin, EnsureOriginWithArg, Get, RankedMembers,
-		RankedMembersSwapHandler,
+		EnsureOrigin, EnsureOriginWithArg, Get, RankedMembers, RankedMembersSwapHandler,
+		tokens::Balance as BalanceTrait,
 	},
-	BoundedVec, CloneNoBound, DebugNoBound, EqNoBound, PartialEqNoBound,
 };
 
 #[cfg(test)]
@@ -146,10 +145,10 @@ pub struct ParamsType<
 }
 
 impl<
-		Balance: Default + Copy + Eq + Debug,
-		BlockNumber: Default + Copy + Eq + Debug,
-		Ranks: Get<u32>,
-	> Default for ParamsType<Balance, BlockNumber, Ranks>
+	Balance: Default + Copy + Eq + Debug,
+	BlockNumber: Default + Copy + Eq + Debug,
+	Ranks: Get<u32>,
+> Default for ParamsType<Balance, BlockNumber, Ranks>
 {
 	fn default() -> Self {
 		Self {
@@ -186,7 +185,7 @@ pub mod pallet {
 	use frame_support::{
 		dispatch::Pays,
 		pallet_prelude::*,
-		traits::{tokens::GetSalary, EnsureOrigin},
+		traits::{EnsureOrigin, tokens::GetSalary},
 	};
 	use frame_system::{ensure_root, pallet_prelude::*};
 	/// The in-code storage version.
@@ -207,10 +206,7 @@ pub mod pallet {
 			+ IsType<<Self as frame_system::Config>::RuntimeEvent>;
 
 		/// The current membership of the fellowship.
-		type Members: RankedMembers<
-			AccountId = <Self as frame_system::Config>::AccountId,
-			Rank = u16,
-		>;
+		type Members: RankedMembers<AccountId = <Self as frame_system::Config>::AccountId, Rank = u16>;
 
 		/// The type in which salaries/budgets are measured.
 		type Balance: BalanceTrait;
@@ -723,11 +719,7 @@ pub mod pallet {
 		/// Rank 1 becomes index 0, rank `RANK_COUNT` becomes index `RANK_COUNT - 1`. Any rank not
 		/// in the range `1..=RANK_COUNT` is `None`.
 		pub(crate) fn rank_to_index(rank: RankOf<T, I>) -> Option<usize> {
-			if rank == 0 || rank > T::MaxRank::get() {
-				None
-			} else {
-				Some((rank - 1) as usize)
-			}
+			if rank == 0 || rank > T::MaxRank::get() { None } else { Some((rank - 1) as usize) }
 		}
 
 		fn dispose_evidence(who: T::AccountId, old_rank: u16, new_rank: Option<u16>) {
@@ -792,14 +784,15 @@ impl<T: Config<I>, I: 'static> Pallet<T, I> {
 	///
 	/// * Every account in [`MemberEvidence`] must also exist in [`Member`].
 	fn try_state_member_evidence() -> Result<(), sp_runtime::TryRuntimeError> {
-		MemberEvidence::<T, I>::iter()
-			.try_for_each(|(who, _)| -> Result<(), sp_runtime::TryRuntimeError> {
+		MemberEvidence::<T, I>::iter().try_for_each(
+			|(who, _)| -> Result<(), sp_runtime::TryRuntimeError> {
 				ensure!(
 					Member::<T, I>::contains_key(&who),
 					"Account in `MemberEvidence` is not tracked in `Member`"
 				);
 				Ok(())
-			})
+			},
+		)
 	}
 }
 

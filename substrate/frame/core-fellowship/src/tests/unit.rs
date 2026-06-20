@@ -26,10 +26,10 @@ use frame_support::{
 	assert_noop, assert_ok, derive_impl, hypothetically, ord_parameter_types,
 	pallet_prelude::Weight,
 	parameter_types,
-	traits::{tokens::GetSalary, ConstU16, ConstU32, IsInVec, TryMapSuccess},
+	traits::{ConstU16, ConstU32, IsInVec, TryMapSuccess, tokens::GetSalary},
 };
 use frame_system::EnsureSignedBy;
-use sp_runtime::{bounded_vec, traits::TryMorphInto, BuildStorage, DispatchError, DispatchResult};
+use sp_runtime::{BuildStorage, DispatchError, DispatchResult, bounded_vec, traits::TryMorphInto};
 
 use crate as pallet_core_fellowship;
 use crate::*;

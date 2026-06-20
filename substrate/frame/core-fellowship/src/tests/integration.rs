@@ -25,13 +25,12 @@ use frame_support::{
 	parameter_types,
 	traits::{ConstU16, EitherOf, IsInVec, MapSuccess, NoOpPoll, TryMapSuccess},
 };
-use frame_system::{pallet_prelude::BlockNumberFor, EnsureSignedBy};
+use frame_system::{EnsureSignedBy, pallet_prelude::BlockNumberFor};
 use pallet_ranked_collective::{EnsureRanked, Geometric, Rank};
 use sp_core::Get;
 use sp_runtime::{
-	bounded_vec,
+	BuildStorage, bounded_vec,
 	traits::{Convert, ReduceBy, ReplaceWithDefault, TryMorphInto},
-	BuildStorage,
 };
 type Class = Rank;
 
