@@ -94,7 +94,7 @@ pub mod pallet {
 	use super::*;
 	use frame_support::{
 		pallet_prelude::{
-			DispatchResultWithPostInfo, IsType, StorageDoubleMap, StorageMap, ValueQuery,
+			DispatchResultWithPostInfo, Hooks, IsType, StorageDoubleMap, StorageMap, ValueQuery,
 		},
 		traits::ClassCountOf,
 		Twox64Concat,
@@ -419,6 +419,74 @@ pub mod pallet {
 			Self::try_remove_vote(&target, index, Some(class), scope)?;
 			Ok(())
 		}
+	}
+
+	#[pallet::hooks]
+	impl<T: Config<I>, I: 'static> Hooks<frame_system::pallet_prelude::BlockNumberFor<T>>
+		for Pallet<T, I>
+	{
+		#[cfg(feature = "try-runtime")]
+		fn try_state(
+			_n: frame_system::pallet_prelude::BlockNumberFor<T>,
+		) -> Result<(), sp_runtime::TryRuntimeError> {
+			Self::do_try_state()
+		}
+	}
+}
+
+#[cfg(any(feature = "try-runtime", test))]
+impl<T: Config<I>, I: 'static> Pallet<T, I> {
+	/// Ensure the correctness of the state of this pallet.
+	///
+	/// This should be valid before or after each state transition of this pallet.
+	pub(crate) fn do_try_state() -> Result<(), sp_runtime::TryRuntimeError> {
+		Self::try_state_class_locks()?;
+		Self::try_state_voting()?;
+		Ok(())
+	}
+
+	/// # Invariants
+	///
+	/// * Each class in [`ClassLocksFor`] must appear at most once per account.
+	/// * Each lock amount in [`ClassLocksFor`] must be non-zero.
+	fn try_state_class_locks() -> Result<(), sp_runtime::TryRuntimeError> {
+		ClassLocksFor::<T, I>::iter().try_for_each(
+			|(_, locks)| -> Result<(), sp_runtime::TryRuntimeError> {
+				let mut seen = alloc::collections::BTreeSet::new();
+				for (class, amount) in locks.iter() {
+					ensure!(seen.insert(class), "Duplicate class found in `ClassLocksFor`");
+					ensure!(!amount.is_zero(), "Zero lock amount found in `ClassLocksFor`");
+				}
+				Ok(())
+			},
+		)
+	}
+
+	/// # Invariants
+	///
+	/// * For accounts in [`Voting::Casting`] state: votes must be sorted by poll index with no
+	///   duplicates (invariant required for the binary search used during vote insertion).
+	/// * For accounts in [`Voting::Delegating`] state: an account may not delegate to itself.
+	fn try_state_voting() -> Result<(), sp_runtime::TryRuntimeError> {
+		VotingFor::<T, I>::iter().try_for_each(
+			|(who, _, voting)| -> Result<(), sp_runtime::TryRuntimeError> {
+				match voting {
+					Voting::Casting(casting) => {
+						ensure!(
+							casting.votes.windows(2).all(|w| w[0].0 < w[1].0),
+							"Votes in `VotingFor` must be sorted by poll index with no duplicates"
+						);
+					},
+					Voting::Delegating(delegating) => {
+						ensure!(
+							delegating.target != who,
+							"Account in `VotingFor` may not delegate to itself"
+						);
+					},
+				}
+				Ok(())
+			},
+		)
 	}
 }
 
