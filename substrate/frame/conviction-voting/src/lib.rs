@@ -448,14 +448,19 @@ impl<T: Config<I>, I: 'static> Pallet<T, I> {
 	/// # Invariants
 	///
 	/// * Each class in [`ClassLocksFor`] must appear at most once per account.
-	/// * Each lock amount in [`ClassLocksFor`] must be non-zero.
+	///
+	/// Note: zero lock amounts are intentionally tolerated. Empty `ClassLocksFor` entries
+	/// (zero locks) currently exist in live state, see
+	/// <https://github.com/paritytech/polkadot-sdk/issues/7458>. Their prevention and cleanup is
+	/// handled separately in <https://github.com/paritytech/polkadot-sdk/pull/7631>, so this check
+	/// is not asserting non-zero amounts until that lands.
 	fn try_state_class_locks() -> Result<(), sp_runtime::TryRuntimeError> {
 		ClassLocksFor::<T, I>::iter().try_for_each(
 			|(_, locks)| -> Result<(), sp_runtime::TryRuntimeError> {
 				let mut seen = alloc::collections::BTreeSet::new();
-				for (class, amount) in locks.iter() {
+				// TODO(#7631): re-assert `!amount.is_zero()` once empty-entry cleanup lands.
+				for (class, _amount) in locks.iter() {
 					ensure!(seen.insert(class), "Duplicate class found in `ClassLocksFor`");
-					ensure!(!amount.is_zero(), "Zero lock amount found in `ClassLocksFor`");
 				}
 				Ok(())
 			},
