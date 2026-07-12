@@ -481,6 +481,14 @@ pub mod pallet {
 		UsernameKilled { username: Username<T> },
 	}
 
+	#[pallet::hooks]
+	impl<T: Config> Hooks<BlockNumberFor<T>> for Pallet<T> {
+		#[cfg(feature = "try-runtime")]
+		fn try_state(_n: BlockNumberFor<T>) -> Result<(), sp_runtime::TryRuntimeError> {
+			Self::do_try_state()
+		}
+	}
+
 	#[pallet::call]
 	/// Identity pallet declaration.
 	impl<T: Config> Pallet<T> {
@@ -1722,6 +1730,114 @@ impl<T: Config> Pallet<T> {
 			&T::AccountId,
 			(BalanceOf<T>, BoundedVec<T::AccountId, T::MaxSubAccounts>),
 		>(&who, (Zero::zero(), sub_accounts));
+		Ok(())
+	}
+}
+
+#[cfg(any(feature = "try-runtime", test))]
+impl<T: Config> Pallet<T> {
+	/// Ensure the correctness of the state of this pallet.
+	///
+	/// This should be valid before or after each state transition of this pallet.
+	pub fn do_try_state() -> Result<(), sp_runtime::TryRuntimeError> {
+		Self::try_state_identities()?;
+		Self::try_state_subs()?;
+		Self::try_state_usernames()?;
+
+		Ok(())
+	}
+
+	/// # Invariants
+	///
+	/// * The judgements of an identity are sorted by registrar index, and a registrar can only have
+	///   one judgement per identity.
+	/// * Every judgement refers to a registrar index that exists in `Registrars`. A removed
+	///   registrar keeps its index, so the judgements it gave stay valid.
+	fn try_state_identities() -> Result<(), sp_runtime::TryRuntimeError> {
+		let registrar_count = Registrars::<T>::get().len();
+
+		for (_, registration) in IdentityOf::<T>::iter() {
+			ensure!(
+				registration.judgements.windows(2).all(|w| w[0].0 < w[1].0),
+				"the judgements of an identity must be sorted by registrar index and unique"
+			);
+
+			for (registrar_index, _) in registration.judgements.iter() {
+				ensure!(
+					(*registrar_index as usize) < registrar_count,
+					"a judgement must be given by a registrar that exists in `Registrars`"
+				);
+			}
+		}
+
+		Ok(())
+	}
+
+	/// # Invariants
+	///
+	/// * `SubsOf` and `SuperOf` are consistent with each other: an account is listed as a sub of
+	///   its super-identity if and only if it points back to that same super-identity.
+	/// * An account holding subs has an identity, since subs are cleared when an identity is.
+	///
+	/// Note that the same account may be listed twice as a sub of a super-identity, as `set_subs`
+	/// does not deduplicate its input.
+	fn try_state_subs() -> Result<(), sp_runtime::TryRuntimeError> {
+		for (super_account, (_, subs)) in SubsOf::<T>::iter() {
+			ensure!(
+				IdentityOf::<T>::contains_key(&super_account),
+				"an account holding subs must have an identity"
+			);
+
+			for sub in subs.iter() {
+				let (super_of_sub, _) = SuperOf::<T>::get(sub)
+					.ok_or("every sub in `SubsOf` must have an entry in `SuperOf`")?;
+				ensure!(
+					super_of_sub == super_account,
+					"a sub in `SubsOf` must point back to the same super-identity in `SuperOf`"
+				);
+			}
+		}
+
+		for (sub, (super_account, _)) in SuperOf::<T>::iter() {
+			ensure!(
+				SubsOf::<T>::get(&super_account).1.contains(&sub),
+				"a sub in `SuperOf` must be listed in the subs of its super-identity"
+			);
+		}
+
+		Ok(())
+	}
+
+	/// # Invariants
+	///
+	/// * The primary username of an account is registered in `UsernameInfoOf` and owned by that
+	///   account.
+	/// * An unbinding username is registered in `UsernameInfoOf`.
+	/// * Usernames are unique, so a username pending acceptance is not registered yet.
+	fn try_state_usernames() -> Result<(), sp_runtime::TryRuntimeError> {
+		for (who, username) in UsernameOf::<T>::iter() {
+			let username_info = UsernameInfoOf::<T>::get(&username)
+				.ok_or("a primary username must be registered in `UsernameInfoOf`")?;
+			ensure!(
+				username_info.owner == who,
+				"a primary username must be owned by the account it is the primary of"
+			);
+		}
+
+		for (username, _) in UnbindingUsernames::<T>::iter() {
+			ensure!(
+				UsernameInfoOf::<T>::contains_key(&username),
+				"an unbinding username must be registered in `UsernameInfoOf`"
+			);
+		}
+
+		for (username, _) in PendingUsernames::<T>::iter() {
+			ensure!(
+				!UsernameInfoOf::<T>::contains_key(&username),
+				"a username pending acceptance must not be registered in `UsernameInfoOf`"
+			);
+		}
+
 		Ok(())
 	}
 }
